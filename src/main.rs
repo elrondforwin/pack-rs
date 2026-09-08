@@ -146,12 +146,6 @@ fn process_request(
             }
         }
         Request::Load(source) => app.start_loading(manager, cache, source),
-        Request::Preview { package, installed } => {
-            match manager.package_info(&package, installed) {
-                Ok(result) => app.show_output(format!("Package Info: {package}"), result.display()),
-                Err(error) => app.show_output(format!("Package Info: {package}"), error),
-            }
-        }
         Request::Execute(action) => match action {
             Action::RefreshCache { without_aur } => match manager.refresh_cache(cache, without_aur)
             {
@@ -481,7 +475,6 @@ impl App {
                 _ => {}
             },
             Screen::Packages(view) => match key.code {
-                KeyCode::Char('/') if !view.searching => view.searching = true,
                 KeyCode::Esc => {
                     next_screen = Some(match view.back {
                         PackageBack::Main => Screen::Main,
@@ -537,11 +530,8 @@ impl App {
                     view.refresh_matches();
                     self.cursor = 0;
                 }
-                KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Up | KeyCode::Char('k') => scroll_up(&mut self.cursor, view.matches.len()),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll_down(&mut self.cursor, view.matches.len())
-                }
+                KeyCode::Up => scroll_up(&mut self.cursor, view.matches.len()),
+                KeyCode::Down => scroll_down(&mut self.cursor, view.matches.len()),
                 KeyCode::PageUp => {
                     let length = view.matches.len();
                     self.cursor = self
@@ -558,22 +548,6 @@ impl App {
                     {
                         *selected = !*selected;
                         scroll_down(&mut self.cursor, view.matches.len());
-                    }
-                }
-                KeyCode::Char('a') => {
-                    let select_all = view.matches.iter().any(|index| !view.selected[*index]);
-                    for &index in &view.matches {
-                        view.selected[index] = select_all;
-                    }
-                }
-                KeyCode::Char('p') => {
-                    if let Some(index) = view.matches.get(self.cursor)
-                        && let Some(package) = view.packages.get(*index)
-                    {
-                        request = Some(Request::Preview {
-                            package: package.clone(),
-                            installed: view.source.is_installed(),
-                        });
                     }
                 }
                 KeyCode::Enter => {
@@ -900,7 +874,6 @@ struct OutputView {
 
 enum Request {
     Load(PackageSource),
-    Preview { package: String, installed: bool },
     Execute(Action),
 }
 
@@ -1313,7 +1286,7 @@ mod tests {
                 notice: None,
                 query: String::new(),
                 query_cursor: 0,
-                searching: false,
+                searching: true,
                 loading: false,
                 scroll_offset: 0,
                 viewport_height: 1,
@@ -1321,7 +1294,6 @@ mod tests {
             should_quit: false,
         };
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
 

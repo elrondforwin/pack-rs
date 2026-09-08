@@ -8,3 +8,6 @@
 # Agent and workspace metadata
 /.agents/
 /.codex/
+
+/pkg/
+*pkg.tar.zst

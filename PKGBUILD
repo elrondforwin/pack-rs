@@ -8,8 +8,7 @@ license=('GPL-3.0-only')
 depends=('glibc' 'pacman')
 makedepends=('cargo')
 optdepends=(
-  'paru: preferred helper for AUR packages'
-  'yay: AUR helper alternative to paru'
+  'yay: optional helper for AUR packages'
   'expac: list recently installed packages'
 )
 source=()

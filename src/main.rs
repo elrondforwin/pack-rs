@@ -42,12 +42,21 @@ const REMOVE_MENU: [&str; 5] = [
     "Orphaned Packages",
     "Back",
 ];
-const ADVANCED_MENU: [&str; 4] = [
+const ADVANCED_MENU_WITH_YAY: [&str; 4] = [
     "Clear Helper Cache",
     "Refresh Pack Cache",
     "Refresh Pack Cache (without AUR)",
     "Back",
 ];
+const ADVANCED_MENU_WITHOUT_YAY: [&str; 2] = ["Refresh Pack Cache (without AUR)", "Back"];
+
+fn advanced_menu(yay_available: bool) -> &'static [&'static str] {
+    if yay_available {
+        &ADVANCED_MENU_WITH_YAY
+    } else {
+        &ADVANCED_MENU_WITHOUT_YAY
+    }
+}
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -76,7 +85,7 @@ fn run(
     cache: &PackageCache,
     route: Route,
 ) -> io::Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(manager.helper().is_some());
     match route {
         Route::Tui => {}
         Route::Install => process_request(
@@ -172,7 +181,7 @@ fn render(frame: &mut Frame, app: &mut App, manager: &PackageManager) {
     match &mut app.screen {
         Screen::Main => render_menu(frame, &MAIN_MENU, cursor),
         Screen::RemoveMenu => render_menu(frame, &REMOVE_MENU, cursor),
-        Screen::AdvancedMenu => render_menu(frame, &ADVANCED_MENU, cursor),
+        Screen::AdvancedMenu => render_menu(frame, advanced_menu(app.yay_available), cursor),
         Screen::Packages(view) => render_packages(frame, view, cursor),
         Screen::Confirm(action) => render_confirmation(frame, action, manager),
         Screen::Output(output) => render_output(frame, output),
@@ -367,18 +376,20 @@ struct App {
     main_cursor: usize,
     remove_cursor: usize,
     advanced_cursor: usize,
+    yay_available: bool,
     loading: Option<LoadingTask>,
     screen: Screen,
     should_quit: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(yay_available: bool) -> Self {
         Self {
             cursor: 0,
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
+            yay_available,
             loading: None,
             screen: Screen::Main,
             should_quit: false,
@@ -423,20 +434,39 @@ impl App {
             Screen::AdvancedMenu => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Esc => next_screen = Some(Screen::Main),
-                KeyCode::Up | KeyCode::Char('k') => previous(&mut self.cursor, ADVANCED_MENU.len()),
-                KeyCode::Down | KeyCode::Char('j') => next(&mut self.cursor, ADVANCED_MENU.len()),
-                KeyCode::Enter => match self.cursor {
-                    0 => next_screen = Some(Screen::Confirm(Action::ClearHelperCache)),
-                    1 => {
-                        next_screen =
-                            Some(Screen::Confirm(Action::RefreshCache { without_aur: false }))
+                KeyCode::Up | KeyCode::Char('k') => {
+                    previous(&mut self.cursor, advanced_menu(self.yay_available).len())
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    next(&mut self.cursor, advanced_menu(self.yay_available).len())
+                }
+                KeyCode::Enter => {
+                    if self.yay_available {
+                        match self.cursor {
+                            0 => next_screen = Some(Screen::Confirm(Action::ClearHelperCache)),
+                            1 => {
+                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
+                                    without_aur: false,
+                                }))
+                            }
+                            2 => {
+                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
+                                    without_aur: true,
+                                }))
+                            }
+                            _ => next_screen = Some(Screen::Main),
+                        }
+                    } else {
+                        match self.cursor {
+                            0 => {
+                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
+                                    without_aur: true,
+                                }))
+                            }
+                            _ => next_screen = Some(Screen::Main),
+                        }
                     }
-                    2 => {
-                        next_screen =
-                            Some(Screen::Confirm(Action::RefreshCache { without_aur: true }))
-                    }
-                    _ => next_screen = Some(Screen::Main),
-                },
+                }
                 _ => {}
             },
             Screen::Packages(view) if view.loading => match key.code {
@@ -1162,6 +1192,15 @@ mod tests {
     }
 
     #[test]
+    fn advanced_menu_hides_aur_refresh_without_yay() {
+        assert_eq!(
+            advanced_menu(false),
+            &["Refresh Pack Cache (without AUR)", "Back"]
+        );
+        assert_eq!(advanced_menu(true).len(), 4);
+    }
+
+    #[test]
     fn selected_packages_only_returns_checked_entries() {
         let view = PackageView {
             source: PackageSource::Available,
@@ -1187,6 +1226,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 1,
             advanced_cursor: 0,
+            yay_available: false,
             loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Installed,
@@ -1262,6 +1302,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
+            yay_available: false,
             loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
@@ -1299,6 +1340,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
+            yay_available: false,
             loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,

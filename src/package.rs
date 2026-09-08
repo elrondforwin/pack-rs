@@ -6,14 +6,12 @@ use crate::cache::PackageCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Helper {
-    Paru,
     Yay,
 }
 
 impl Helper {
     fn command(self) -> &'static str {
         match self {
-            Self::Paru => "paru",
             Self::Yay => "yay",
         }
     }
@@ -77,8 +75,10 @@ impl Action {
                 packages.len(),
                 packages.join("\n")
             ),
-            Self::UpdateSystem => "System and AUR packages will be updated.".to_owned(),
-            Self::ClearHelperCache => "The AUR helper cache will be cleared with -Scc.".to_owned(),
+            Self::UpdateSystem => "System packages will be updated.".to_owned(),
+            Self::ClearHelperCache => {
+                "The package manager cache will be cleared with -Scc.".to_owned()
+            }
             Self::RefreshCache { without_aur: false } => {
                 "The package list will be regenerated through the AUR helper.".to_owned()
             }
@@ -96,16 +96,16 @@ impl Action {
             }
             Self::Install(packages) => Ok(format!(
                 "{} -S {}",
-                require_helper(helper)?.command(),
+                package_command(helper),
                 packages.join(" ")
             )),
             Self::Remove(packages) => Ok(format!(
                 "{} -Rns {}",
-                require_helper(helper)?.command(),
+                package_command(helper),
                 packages.join(" ")
             )),
-            Self::UpdateSystem => Ok(format!("{} -Syu", require_helper(helper)?.command())),
-            Self::ClearHelperCache => Ok(format!("{} -Scc", require_helper(helper)?.command())),
+            Self::UpdateSystem => Ok(format!("{} -Syu", package_command(helper))),
+            Self::ClearHelperCache => Ok(format!("{} -Scc", package_command(helper))),
         }
     }
 }
@@ -122,9 +122,7 @@ pub struct PackageManager {
 
 impl PackageManager {
     pub fn detect() -> Self {
-        let helper = command_exists("paru")
-            .then_some(Helper::Paru)
-            .or_else(|| command_exists("yay").then_some(Helper::Yay));
+        let helper = command_exists("yay").then_some(Helper::Yay);
         Self { helper }
     }
 
@@ -143,16 +141,16 @@ impl PackageManager {
     }
 
     pub fn package_info(&self, package: &str, installed: bool) -> Result<CommandResult, String> {
-        let helper = require_helper(self.helper)?;
+        let program = package_command(self.helper);
         let argument = if installed { "-Qi" } else { "-Sii" };
-        run_capture(helper.command(), &[argument.to_owned(), package.to_owned()])
+        run_capture(program, &[argument.to_owned(), package.to_owned()])
     }
 
     pub fn refresh_cache(&self, cache: &PackageCache, without_aur: bool) -> Result<usize, String> {
         let program = if without_aur {
             "pacman"
         } else {
-            require_helper(self.helper)?.command()
+            package_command(self.helper)
         };
         let result = run_capture(program, &["-Sl".to_owned()])?;
         let packages = successful_packages(result, "Could not retrieve the package list")?;
@@ -163,12 +161,15 @@ impl PackageManager {
     }
 
     pub fn run_interactive(&self, action: &Action) -> Result<String, String> {
-        let helper = require_helper(self.helper)?;
         let (program, args) = match action {
-            Action::Install(packages) => (helper.command(), package_args("-S", packages)),
-            Action::Remove(packages) => (helper.command(), package_args("-Rns", packages)),
-            Action::UpdateSystem => (helper.command(), vec!["-Syu".to_owned()]),
-            Action::ClearHelperCache => (helper.command(), vec!["-Scc".to_owned()]),
+            Action::Install(packages) => {
+                (package_command(self.helper), package_args("-S", packages))
+            }
+            Action::Remove(packages) => {
+                (package_command(self.helper), package_args("-Rns", packages))
+            }
+            Action::UpdateSystem => (package_command(self.helper), vec!["-Syu".to_owned()]),
+            Action::ClearHelperCache => (package_command(self.helper), vec!["-Scc".to_owned()]),
             Action::RefreshCache { .. } => {
                 return Err("Cache refresh runs through captured output.".to_owned());
             }
@@ -223,9 +224,8 @@ impl PackageManager {
     }
 
     fn list_with_helper(&self, args: &[&str]) -> Result<PackageList, String> {
-        let helper = require_helper(self.helper)?;
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let result = run_capture(helper.command(), &args)?;
+        let result = run_capture(package_command(self.helper), &args)?;
         let packages = successful_lines(result, "Could not retrieve the package list")?;
         Ok(PackageList {
             packages,
@@ -397,7 +397,11 @@ fn command_error(result: CommandResult, context: &str) -> String {
 }
 
 fn require_helper(helper: Option<Helper>) -> Result<Helper, String> {
-    helper.ok_or_else(|| "paru or yay is required on PATH for AUR operations.".to_owned())
+    helper.ok_or_else(|| "yay is required on PATH for AUR operations.".to_owned())
+}
+
+fn package_command(helper: Option<Helper>) -> &'static str {
+    helper.map_or("pacman", Helper::command)
 }
 
 fn command_exists(command: &str) -> bool {

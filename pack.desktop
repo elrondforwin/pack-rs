@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Pack
+Comment=Arch Linux package manager
+Exec=pack
+Icon=package
+Terminal=true
+Categories=Settings;PackageManager;
+Keywords=arch;aur;pacman;paru;yay;package;

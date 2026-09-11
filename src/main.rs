@@ -5,7 +5,7 @@ use std::{
     env, io, process,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -118,6 +118,9 @@ fn run(
         }
         if let Some((package, result)) = app.poll_details() {
             app.set_package_details(package, result);
+        }
+        if let Some(request) = app.poll_details_debounce() {
+            process_request(&mut app, terminal, manager, cache, request);
         }
         terminal
             .terminal_mut()
@@ -448,6 +451,7 @@ struct App {
     yay_available: bool,
     loading: Option<LoadingTask>,
     details_loading: Option<DetailsTask>,
+    details_debounce: Option<Instant>,
     screen: Screen,
     should_quit: bool,
 }
@@ -462,6 +466,7 @@ impl App {
             yay_available,
             loading: None,
             details_loading: None,
+            details_debounce: None,
             screen: Screen::Main,
             should_quit: false,
         }
@@ -573,6 +578,7 @@ impl App {
                 {
                     view.details_visible = !view.details_visible;
                     view.details = None;
+                    self.details_debounce = None;
                     if view.details_visible {
                         request = package_details_request(view, self.cursor);
                     }
@@ -580,6 +586,7 @@ impl App {
                 KeyCode::Char('\u{10}') => {
                     view.details_visible = !view.details_visible;
                     view.details = None;
+                    self.details_debounce = None;
                     if view.details_visible {
                         request = package_details_request(view, self.cursor);
                     }
@@ -600,6 +607,9 @@ impl App {
                     delete_previous_word(view);
                     view.refresh_matches();
                     self.cursor = 0;
+                    if view.details_visible {
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
+                    }
                 }
                 KeyCode::Backspace
                     if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -607,11 +617,17 @@ impl App {
                     delete_previous_word(view);
                     view.refresh_matches();
                     self.cursor = 0;
+                    if view.details_visible {
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
+                    }
                 }
                 KeyCode::Backspace if view.searching => {
                     delete_previous_character(view);
                     view.refresh_matches();
                     self.cursor = 0;
+                    if view.details_visible {
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
+                    }
                 }
                 KeyCode::Home if view.searching => view.query_cursor = 0,
                 KeyCode::End if view.searching => view.query_cursor = view.query.len(),
@@ -633,19 +649,19 @@ impl App {
                     view.refresh_matches();
                     self.cursor = 0;
                     if view.details_visible {
-                        request = package_details_request(view, self.cursor);
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
                 KeyCode::Up => {
                     scroll_up(&mut self.cursor, view.matches.len());
                     if view.details_visible {
-                        request = package_details_request(view, self.cursor);
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
                 KeyCode::Down => {
                     scroll_down(&mut self.cursor, view.matches.len());
                     if view.details_visible {
-                        request = package_details_request(view, self.cursor);
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
                 KeyCode::PageUp => {
@@ -655,13 +671,13 @@ impl App {
                         .saturating_add(PAGE_SIZE)
                         .min(length.saturating_sub(1));
                     if view.details_visible {
-                        request = package_details_request(view, self.cursor);
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
                 KeyCode::PageDown => {
                     self.cursor = self.cursor.saturating_sub(PAGE_SIZE);
                     if view.details_visible {
-                        request = package_details_request(view, self.cursor);
+                        self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
                 KeyCode::Char(' ') | KeyCode::Tab => {
@@ -671,7 +687,8 @@ impl App {
                         *selected = !*selected;
                         scroll_down(&mut self.cursor, view.matches.len());
                         if view.details_visible {
-                            request = package_details_request(view, self.cursor);
+                            self.details_debounce =
+                                Some(Instant::now() + Duration::from_millis(250));
                         }
                     }
                 }
@@ -806,6 +823,13 @@ impl App {
         package: String,
         installed: bool,
     ) {
+        if self
+            .details_loading
+            .as_ref()
+            .is_some_and(|task| task.package == package)
+        {
+            return;
+        }
         let (sender, receiver) = mpsc::channel();
         let manager = manager.clone();
         let requested_package = package.clone();
@@ -818,10 +842,10 @@ impl App {
         });
         if let Screen::Packages(view) = &mut self.screen {
             view.details = None;
-            view.details_package = Some(package);
+            view.details_package = Some(package.clone());
             view.details_scroll = 0;
         }
-        self.details_loading = Some(DetailsTask { receiver });
+        self.details_loading = Some(DetailsTask { package, receiver });
     }
 
     fn poll_loading(&mut self) -> Option<(PackageSource, Result<PackageList, String>)> {
@@ -853,6 +877,18 @@ impl App {
                 self.details_loading = None;
                 None
             }
+        }
+    }
+
+    fn poll_details_debounce(&mut self) -> Option<Request> {
+        if self
+            .details_debounce
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.details_debounce = None;
+            package_details_request_from_screen(self)
+        } else {
+            None
         }
     }
 
@@ -932,6 +968,7 @@ struct LoadingTask {
 }
 
 struct DetailsTask {
+    package: String,
     receiver: Receiver<(String, String)>,
 }
 
@@ -1412,6 +1449,7 @@ mod tests {
             yay_available: false,
             loading: None,
             details_loading: None,
+            details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Installed,
                 packages: vec!["extra/fzf".to_owned()],
@@ -1493,6 +1531,7 @@ mod tests {
             yay_available: false,
             loading: None,
             details_loading: None,
+            details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
@@ -1535,6 +1574,7 @@ mod tests {
             yay_available: false,
             loading: None,
             details_loading: None,
+            details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],

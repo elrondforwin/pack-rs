@@ -140,6 +140,12 @@ impl PackageManager {
         }
     }
 
+    pub fn package_info(&self, package: &str, installed: bool) -> Result<CommandResult, String> {
+        let program = package_command(self.helper);
+        let argument = if installed { "-Qi" } else { "-Sii" };
+        run_capture(program, &[argument.to_owned(), package.to_owned()])
+    }
+
     pub fn refresh_cache(&self, cache: &PackageCache, without_aur: bool) -> Result<usize, String> {
         let program = if without_aur {
             "pacman"
@@ -276,6 +282,25 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+impl CommandResult {
+    pub fn display(&self) -> String {
+        let mut output = String::new();
+        if !self.stdout.trim().is_empty() {
+            output.push_str(self.stdout.trim());
+        }
+        if !self.stderr.trim().is_empty() {
+            if !output.is_empty() {
+                output.push_str("\n\nError output:\n");
+            }
+            output.push_str(self.stderr.trim());
+        }
+        if output.is_empty() {
+            output.push_str("The command produced no output.");
+        }
+        output
+    }
 }
 
 fn run_capture(program: &str, args: &[String]) -> Result<CommandResult, String> {

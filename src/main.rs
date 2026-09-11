@@ -21,8 +21,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
 use cache::PackageCache;
@@ -108,9 +108,16 @@ fn run(
     while !app.should_quit {
         if let Some((source, result)) = app.poll_loading() {
             match result {
-                Ok(list) => app.show_packages(source, list),
+                Ok(list) => {
+                    if let Some(request) = app.show_packages(source, list) {
+                        process_request(&mut app, terminal, manager, cache, request);
+                    }
+                }
                 Err(error) => app.show_output(source.title(), error),
             }
+        }
+        if let Some((package, result)) = app.poll_details() {
+            app.set_package_details(package, result);
         }
         terminal
             .terminal_mut()
@@ -141,11 +148,18 @@ fn process_request(
     match request {
         Request::Load(source) if source == PackageSource::Available && cache.is_fresh() => {
             match manager.list(cache, source) {
-                Ok(list) => app.show_packages(source, list),
+                Ok(list) => {
+                    if let Some(request) = app.show_packages(source, list) {
+                        process_request(app, terminal, manager, cache, request);
+                    }
+                }
                 Err(error) => app.show_output(source.title(), error),
             }
         }
         Request::Load(source) => app.start_loading(manager, cache, source),
+        Request::Details { package, installed } => {
+            app.start_details_loading(manager, package, installed);
+        }
         Request::Execute(action) => match action {
             Action::RefreshCache { without_aur } => match manager.refresh_cache(cache, without_aur)
             {
@@ -238,7 +252,32 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
         areas[1],
     );
 
-    render_package_results(frame, areas[0], view, cursor);
+    if view.details_visible {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(areas[0]);
+        render_package_results(frame, columns[0], view, cursor);
+        let details = view
+            .details
+            .as_deref()
+            .unwrap_or("Loading package details...");
+        frame.render_widget(
+            Paragraph::new(format_details(details))
+                .style(Style::default().fg(Color::Gray))
+                .scroll((view.details_scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .padding(Padding::uniform(1))
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .wrap(Wrap { trim: false }),
+            columns[1],
+        );
+    } else {
+        render_package_results(frame, areas[0], view, cursor);
+    }
 
     let search = if view.searching {
         format!(
@@ -331,6 +370,42 @@ fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView,
     }
 }
 
+fn format_details(details: &str) -> Text<'static> {
+    const BASIC_FIELDS: [&str; 12] = [
+        "Repository",
+        "Name",
+        "Version",
+        "Description",
+        "Architecture",
+        "URL",
+        "Licenses",
+        "Download Size",
+        "Installed Size",
+        "Packager",
+        "Build Date",
+        "Install Date",
+    ];
+    let key_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(Color::Gray);
+    let mut lines = Vec::new();
+
+    for line in details.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            if BASIC_FIELDS.contains(&key) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{key}: "), key_style),
+                    Span::styled(value.trim().to_owned(), value_style),
+                ]));
+            }
+        }
+    }
+
+    Text::from(lines)
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -372,6 +447,7 @@ struct App {
     advanced_cursor: usize,
     yay_available: bool,
     loading: Option<LoadingTask>,
+    details_loading: Option<DetailsTask>,
     screen: Screen,
     should_quit: bool,
 }
@@ -385,6 +461,7 @@ impl App {
             advanced_cursor: 0,
             yay_available,
             loading: None,
+            details_loading: None,
             screen: Screen::Main,
             should_quit: false,
         }
@@ -491,6 +568,32 @@ impl App {
                 {
                     view.query_cursor = view.query.len();
                 }
+                KeyCode::Char('p') | KeyCode::Char('P')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    view.details_visible = !view.details_visible;
+                    view.details = None;
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
+                }
+                KeyCode::Char('\u{10}') => {
+                    view.details_visible = !view.details_visible;
+                    view.details = None;
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down
+                    if view.details_visible && key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    view.details_scroll = view.details_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up
+                    if view.details_visible && key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    view.details_scroll = view.details_scroll.saturating_sub(1);
+                }
                 KeyCode::Char('h') | KeyCode::Char('w')
                     if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
@@ -529,18 +632,37 @@ impl App {
                     view.query_cursor += character.len_utf8();
                     view.refresh_matches();
                     self.cursor = 0;
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
                 }
-                KeyCode::Up => scroll_up(&mut self.cursor, view.matches.len()),
-                KeyCode::Down => scroll_down(&mut self.cursor, view.matches.len()),
+                KeyCode::Up => {
+                    scroll_up(&mut self.cursor, view.matches.len());
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
+                }
+                KeyCode::Down => {
+                    scroll_down(&mut self.cursor, view.matches.len());
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
+                }
                 KeyCode::PageUp => {
                     let length = view.matches.len();
                     self.cursor = self
                         .cursor
                         .saturating_add(PAGE_SIZE)
                         .min(length.saturating_sub(1));
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
                 }
                 KeyCode::PageDown => {
                     self.cursor = self.cursor.saturating_sub(PAGE_SIZE);
+                    if view.details_visible {
+                        request = package_details_request(view, self.cursor);
+                    }
                 }
                 KeyCode::Char(' ') | KeyCode::Tab => {
                     if let Some(index) = view.matches.get(self.cursor)
@@ -548,6 +670,9 @@ impl App {
                     {
                         *selected = !*selected;
                         scroll_down(&mut self.cursor, view.matches.len());
+                        if view.details_visible {
+                            request = package_details_request(view, self.cursor);
+                        }
                     }
                 }
                 KeyCode::Enter => {
@@ -666,9 +791,37 @@ impl App {
             query_cursor: 0,
             searching: false,
             loading: true,
+            details_visible: true,
+            details: None,
+            details_package: None,
+            details_scroll: 0,
             scroll_offset: 0,
             viewport_height: 1,
         }));
+    }
+
+    fn start_details_loading(
+        &mut self,
+        manager: &PackageManager,
+        package: String,
+        installed: bool,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let manager = manager.clone();
+        let requested_package = package.clone();
+        thread::spawn(move || {
+            let result = manager
+                .package_info(&requested_package, installed)
+                .map(|result| result.display())
+                .unwrap_or_else(|error| error);
+            let _ = sender.send((requested_package, result));
+        });
+        if let Screen::Packages(view) = &mut self.screen {
+            view.details = None;
+            view.details_package = Some(package);
+            view.details_scroll = 0;
+        }
+        self.details_loading = Some(DetailsTask { receiver });
     }
 
     fn poll_loading(&mut self) -> Option<(PackageSource, Result<PackageList, String>)> {
@@ -688,14 +841,29 @@ impl App {
         }
     }
 
-    fn show_packages(&mut self, source: PackageSource, list: PackageList) {
+    fn poll_details(&mut self) -> Option<(String, String)> {
+        let task = self.details_loading.as_ref()?;
+        match task.receiver.try_recv() {
+            Ok(result) => {
+                self.details_loading = None;
+                Some(result)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.details_loading = None;
+                None
+            }
+        }
+    }
+
+    fn show_packages(&mut self, source: PackageSource, list: PackageList) -> Option<Request> {
         if list.packages.is_empty() {
             self.show_output(
                 source.title(),
                 list.notice
                     .unwrap_or_else(|| "No packages found.".to_owned()),
             );
-            return;
+            return None;
         }
         let packages = list.packages;
         let matches = fuzzy_matches("", &packages);
@@ -717,9 +885,14 @@ impl App {
             query_cursor: 0,
             searching: true,
             loading: false,
+            details_visible: true,
+            details: None,
+            details_package: None,
+            details_scroll: 0,
             scroll_offset: 0,
             viewport_height: 1,
         }));
+        package_details_request_from_screen(self)
     }
 
     fn show_confirmation(&mut self, action: Action) {
@@ -732,6 +905,15 @@ impl App {
             body: body.into(),
             scroll: 0,
         }));
+    }
+
+    fn set_package_details(&mut self, package: String, details: String) {
+        if let Screen::Packages(view) = &mut self.screen
+            && view.details_visible
+            && view.details_package.as_deref() == Some(package.as_str())
+        {
+            view.details = Some(details);
+        }
     }
 }
 
@@ -749,6 +931,10 @@ struct LoadingTask {
     receiver: Receiver<Result<PackageList, String>>,
 }
 
+struct DetailsTask {
+    receiver: Receiver<(String, String)>,
+}
+
 struct PackageView {
     source: PackageSource,
     packages: Vec<String>,
@@ -760,6 +946,10 @@ struct PackageView {
     query_cursor: usize,
     searching: bool,
     loading: bool,
+    details_visible: bool,
+    details: Option<String>,
+    details_package: Option<String>,
+    details_scroll: u16,
     scroll_offset: usize,
     viewport_height: usize,
 }
@@ -773,6 +963,21 @@ enum PackageBack {
 impl PackageView {
     fn refresh_matches(&mut self) {
         self.matches = fuzzy_matches(&self.query, &self.packages);
+    }
+}
+
+fn package_details_request(view: &PackageView, cursor: usize) -> Option<Request> {
+    let index = *view.matches.get(cursor)?;
+    Some(Request::Details {
+        package: view.packages.get(index)?.clone(),
+        installed: view.source.is_installed(),
+    })
+}
+
+fn package_details_request_from_screen(app: &App) -> Option<Request> {
+    match &app.screen {
+        Screen::Packages(view) if view.details_visible => package_details_request(view, app.cursor),
+        _ => None,
     }
 }
 
@@ -874,6 +1079,7 @@ struct OutputView {
 
 enum Request {
     Load(PackageSource),
+    Details { package: String, installed: bool },
     Execute(Action),
 }
 
@@ -1186,6 +1392,10 @@ mod tests {
             query_cursor: 0,
             searching: false,
             loading: false,
+            details_visible: false,
+            details: None,
+            details_package: None,
+            details_scroll: 0,
             scroll_offset: 0,
             viewport_height: 1,
         };
@@ -1201,6 +1411,7 @@ mod tests {
             advanced_cursor: 0,
             yay_available: false,
             loading: None,
+            details_loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Installed,
                 packages: vec!["extra/fzf".to_owned()],
@@ -1212,6 +1423,10 @@ mod tests {
                 query_cursor: 0,
                 searching: true,
                 loading: false,
+                details_visible: false,
+                details: None,
+                details_package: None,
+                details_scroll: 0,
                 scroll_offset: 0,
                 viewport_height: 1,
             }),
@@ -1277,6 +1492,7 @@ mod tests {
             advanced_cursor: 0,
             yay_available: false,
             loading: None,
+            details_loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
@@ -1288,6 +1504,10 @@ mod tests {
                 query_cursor: 0,
                 searching: true,
                 loading: false,
+                details_visible: false,
+                details: None,
+                details_package: None,
+                details_scroll: 0,
                 scroll_offset: 0,
                 viewport_height: 1,
             }),
@@ -1314,6 +1534,7 @@ mod tests {
             advanced_cursor: 0,
             yay_available: false,
             loading: None,
+            details_loading: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
@@ -1325,6 +1546,10 @@ mod tests {
                 query_cursor: 0,
                 searching: false,
                 loading: false,
+                details_visible: false,
+                details: None,
+                details_package: None,
+                details_scroll: 0,
                 scroll_offset: 0,
                 viewport_height: 1,
             }),

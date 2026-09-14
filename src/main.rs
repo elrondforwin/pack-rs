@@ -1191,11 +1191,10 @@ fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
         .filter_map(|(index, package)| fuzzy_score(&query, package).map(|score| (index, score)))
         .collect::<Vec<_>>();
     matches.sort_unstable_by(|(left_index, left_score), (right_index, right_score)| {
-        is_aur_package(&packages[*left_index])
-            .cmp(&is_aur_package(&packages[*right_index]))
+        is_exact_package_name(&query, &packages[*right_index])
+            .cmp(&is_exact_package_name(&query, &packages[*left_index]))
             .then_with(|| {
-                is_exact_package_name(&query, &packages[*right_index])
-                    .cmp(&is_exact_package_name(&query, &packages[*left_index]))
+                is_aur_package(&packages[*left_index]).cmp(&is_aur_package(&packages[*right_index]))
             })
             .then_with(|| right_score.cmp(left_score))
             .then_with(|| left_index.cmp(right_index))
@@ -1517,6 +1516,16 @@ mod tests {
     #[test]
     fn aur_packages_always_follow_non_aur_packages() {
         let packages = vec!["aur/discord".to_owned(), "extra/discord-helper".to_owned()];
+
+        assert_eq!(fuzzy_matches("disco", &packages), vec![1, 0]);
+    }
+
+    #[test]
+    fn exact_aur_package_beats_non_aur_fuzzy_match() {
+        let packages = vec![
+            "extra/discord-account-manager-git".to_owned(),
+            "aur/discord".to_owned(),
+        ];
 
         assert_eq!(fuzzy_matches("discord", &packages), vec![1, 0]);
     }

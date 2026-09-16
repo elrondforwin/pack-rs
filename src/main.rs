@@ -1165,6 +1165,11 @@ fn selected_packages(view: &PackageView) -> Vec<String> {
 }
 
 fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
+    let query = query
+        .to_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
     if query.is_empty() {
         let mut matches = Vec::with_capacity(packages.len());
         matches.extend(
@@ -1184,7 +1189,6 @@ fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
         return matches;
     }
 
-    let query = query.to_lowercase();
     let mut matches = packages
         .iter()
         .enumerate()
@@ -1528,6 +1532,13 @@ mod tests {
         ];
 
         assert_eq!(fuzzy_matches("discord", &packages), vec![1, 0]);
+    }
+
+    #[test]
+    fn fuzzy_search_ignores_spaces_in_the_query() {
+        let packages = vec!["extra/discord-canary".to_owned()];
+
+        assert_eq!(fuzzy_matches("discord canary", &packages), vec![0]);
     }
 
     #[test]

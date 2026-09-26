@@ -261,10 +261,18 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(areas[0]);
         render_package_results(frame, columns[0], view, cursor);
-        let details = view
-            .details
-            .as_deref()
-            .unwrap_or("Loading package details...");
+        let current = view
+            .matches
+            .get(cursor)
+            .and_then(|index| view.packages.get(*index));
+        let details = match current {
+            None => "No matching package.",
+            Some(package) if view.details_package.as_deref() == Some(package.as_str()) => view
+                .details
+                .as_deref()
+                .unwrap_or("Loading package details..."),
+            Some(_) => "Loading package details...",
+        };
         frame.render_widget(
             Paragraph::new(format_details(details))
                 .style(Style::default().fg(Color::Gray))
@@ -282,23 +290,13 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
         render_package_results(frame, areas[0], view, cursor);
     }
 
-    let search = if view.searching {
-        format!(
-            "/ {}▌{}",
-            &view.query[..view.query_cursor],
-            &view.query[view.query_cursor..]
-        )
-    } else if view.query.is_empty() {
-        "/ to search".to_owned()
-    } else {
-        format!("/ {}", view.query)
-    };
+    let search = format!(
+        "/ {}▌{}",
+        &view.query[..view.query_cursor],
+        &view.query[view.query_cursor..]
+    );
     frame.render_widget(
-        Paragraph::new(search).style(if view.searching {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }),
+        Paragraph::new(search).style(Style::default().fg(Color::Cyan)),
         areas[2],
     );
 }
@@ -406,7 +404,11 @@ fn format_details(details: &str) -> Text<'static> {
         }
     }
 
-    Text::from(lines)
+    if lines.is_empty() {
+        Text::raw(details.to_owned())
+    } else {
+        Text::from(lines)
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -476,7 +478,6 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
-
         let mut next_screen = None;
         let mut request = None;
         match &mut self.screen {
@@ -563,14 +564,10 @@ impl App {
                         PackageBack::RemoveMenu => Screen::RemoveMenu,
                     })
                 }
-                KeyCode::Char('a')
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     view.query_cursor = 0;
                 }
-                KeyCode::Char('e')
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     view.query_cursor = view.query.len();
                 }
                 KeyCode::Char('p') | KeyCode::Char('P')
@@ -602,50 +599,52 @@ impl App {
                     view.details_scroll = view.details_scroll.saturating_sub(1);
                 }
                 KeyCode::Char('h') | KeyCode::Char('w')
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     delete_previous_word(view);
+                    view.details = None;
+                    view.details_package = None;
                     view.refresh_matches();
                     self.cursor = 0;
                     if view.details_visible {
                         self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
-                KeyCode::Backspace
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     delete_previous_word(view);
+                    view.details = None;
+                    view.details_package = None;
                     view.refresh_matches();
                     self.cursor = 0;
                     if view.details_visible {
                         self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
-                KeyCode::Backspace if view.searching => {
+                KeyCode::Backspace => {
                     delete_previous_character(view);
+                    view.details = None;
+                    view.details_package = None;
                     view.refresh_matches();
                     self.cursor = 0;
                     if view.details_visible {
                         self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
-                KeyCode::Home if view.searching => view.query_cursor = 0,
-                KeyCode::End if view.searching => view.query_cursor = view.query.len(),
-                KeyCode::Left
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Home => view.query_cursor = 0,
+                KeyCode::End => view.query_cursor = view.query.len(),
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     move_query_word_left(view);
                 }
-                KeyCode::Right
-                    if view.searching && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     move_query_word_right(view);
                 }
-                KeyCode::Left if view.searching => move_query_left(view),
-                KeyCode::Right if view.searching => move_query_right(view),
-                KeyCode::Char(character) if view.searching && !character.is_control() => {
+                KeyCode::Left => move_query_left(view),
+                KeyCode::Right => move_query_right(view),
+                KeyCode::Char(character) if !character.is_control() => {
                     view.query.insert(view.query_cursor, character);
                     view.query_cursor += character.len_utf8();
+                    view.details = None;
+                    view.details_package = None;
                     view.refresh_matches();
                     self.cursor = 0;
                     if view.details_visible {
@@ -680,7 +679,7 @@ impl App {
                         self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
                     }
                 }
-                KeyCode::Char(' ') | KeyCode::Tab => {
+                KeyCode::Tab => {
                     if let Some(index) = view.matches.get(self.cursor)
                         && let Some(selected) = view.selected.get_mut(*index)
                     {
@@ -746,9 +745,15 @@ impl App {
         match (&mut self.screen, mouse.kind) {
             (Screen::Packages(view), MouseEventKind::ScrollUp) => {
                 scroll_up(&mut self.cursor, view.matches.len());
+                if view.details_visible {
+                    self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
+                }
             }
             (Screen::Packages(view), MouseEventKind::ScrollDown) => {
                 scroll_down(&mut self.cursor, view.matches.len());
+                if view.details_visible {
+                    self.details_debounce = Some(Instant::now() + Duration::from_millis(250));
+                }
             }
             (Screen::Output(output), MouseEventKind::ScrollUp) => {
                 output.scroll = output.scroll.saturating_sub(1);
@@ -800,13 +805,13 @@ impl App {
         self.set_screen(Screen::Packages(PackageView {
             source,
             packages: Vec::new(),
+            folded_packages: Vec::new(),
             matches: Vec::new(),
             back,
             selected: Vec::new(),
             notice: None,
             query: String::new(),
             query_cursor: 0,
-            searching: false,
             loading: true,
             details_visible: true,
             details: None,
@@ -826,8 +831,12 @@ impl App {
         if self
             .details_loading
             .as_ref()
-            .is_some_and(|task| task.package == package)
+            .is_some_and(|task| task.package == package && task.installed == installed)
         {
+            if let Screen::Packages(view) = &mut self.screen {
+                view.details = None;
+                view.details_package = Some(package);
+            }
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -845,7 +854,11 @@ impl App {
             view.details_package = Some(package.clone());
             view.details_scroll = 0;
         }
-        self.details_loading = Some(DetailsTask { package, receiver });
+        self.details_loading = Some(DetailsTask {
+            package,
+            installed,
+            receiver,
+        });
     }
 
     fn poll_loading(&mut self) -> Option<(PackageSource, Result<PackageList, String>)> {
@@ -902,7 +915,11 @@ impl App {
             return None;
         }
         let packages = list.packages;
-        let matches = fuzzy_matches("", &packages);
+        let folded_packages = packages
+            .iter()
+            .map(|package| package.to_lowercase())
+            .collect::<Vec<_>>();
+        let matches = fuzzy_matches_prepared("", &packages, &folded_packages);
         let back = match source {
             PackageSource::Available => PackageBack::Main,
             PackageSource::Installed
@@ -913,13 +930,13 @@ impl App {
         self.set_screen(Screen::Packages(PackageView {
             selected: vec![false; packages.len()],
             packages,
+            folded_packages,
             matches,
             back,
             source,
             notice: list.notice,
             query: String::new(),
             query_cursor: 0,
-            searching: true,
             loading: false,
             details_visible: true,
             details: None,
@@ -947,6 +964,11 @@ impl App {
         if let Screen::Packages(view) = &mut self.screen
             && view.details_visible
             && view.details_package.as_deref() == Some(package.as_str())
+            && view
+                .matches
+                .get(self.cursor)
+                .and_then(|index| view.packages.get(*index))
+                .is_some_and(|current| current == &package)
         {
             view.details = Some(details);
         }
@@ -969,19 +991,20 @@ struct LoadingTask {
 
 struct DetailsTask {
     package: String,
+    installed: bool,
     receiver: Receiver<(String, String)>,
 }
 
 struct PackageView {
     source: PackageSource,
     packages: Vec<String>,
+    folded_packages: Vec<String>,
     matches: Vec<usize>,
     back: PackageBack,
     selected: Vec<bool>,
     notice: Option<String>,
     query: String,
     query_cursor: usize,
-    searching: bool,
     loading: bool,
     details_visible: bool,
     details: Option<String>,
@@ -999,7 +1022,7 @@ enum PackageBack {
 
 impl PackageView {
     fn refresh_matches(&mut self) {
-        self.matches = fuzzy_matches(&self.query, &self.packages);
+        self.matches = fuzzy_matches_prepared(&self.query, &self.packages, &self.folded_packages);
     }
 }
 
@@ -1164,7 +1187,16 @@ fn selected_packages(view: &PackageView) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
+    let folded = packages
+        .iter()
+        .map(|package| package.to_lowercase())
+        .collect::<Vec<_>>();
+    fuzzy_matches_prepared(query, packages, &folded)
+}
+
+fn fuzzy_matches_prepared(query: &str, packages: &[String], folded: &[String]) -> Vec<usize> {
     let query = query
         .to_lowercase()
         .chars()
@@ -1189,21 +1221,29 @@ fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
         return matches;
     }
 
-    let mut matches = packages
+    let mut matches = folded
         .iter()
         .enumerate()
-        .filter_map(|(index, package)| fuzzy_score(&query, package).map(|score| (index, score)))
-        .collect::<Vec<_>>();
-    matches.sort_unstable_by(|(left_index, left_score), (right_index, right_score)| {
-        is_exact_package_name(&query, &packages[*right_index])
-            .cmp(&is_exact_package_name(&query, &packages[*left_index]))
-            .then_with(|| {
-                is_aur_package(&packages[*left_index]).cmp(&is_aur_package(&packages[*right_index]))
+        .filter_map(|(index, package)| {
+            fuzzy_score(&query, package).map(|score| {
+                (
+                    index,
+                    score,
+                    is_exact_package_name(&query, &packages[index]),
+                    is_aur_package(&packages[index]),
+                )
             })
-            .then_with(|| right_score.cmp(left_score))
-            .then_with(|| left_index.cmp(right_index))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.0.cmp(&right.0))
     });
-    matches.into_iter().map(|(index, _)| index).collect()
+    matches.into_iter().map(|(index, ..)| index).collect()
 }
 
 fn is_aur_package(candidate: &str) -> bool {
@@ -1222,27 +1262,31 @@ fn is_exact_package_name(query: &str, candidate: &str) -> bool {
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     // ponytail: simple sequential scorer; replace only if ranking quality becomes a measurable issue.
-    let candidate = candidate.to_lowercase();
-    let characters = candidate.chars().collect::<Vec<_>>();
-    let mut search_from = 0;
+    let mut characters = candidate.chars().enumerate();
     let mut previous = None;
+    let mut preceding = None;
     let mut score = 0;
 
     for query_character in query.chars() {
-        let position = characters[search_from..]
-            .iter()
-            .position(|character| *character == query_character)
-            .map(|offset| search_from + offset)?;
+        let position = loop {
+            let (position, character) = characters.next()?;
+            if character == query_character {
+                break position;
+            }
+            preceding = Some(character);
+        };
         score += 10;
         if previous.is_some_and(|last| last + 1 == position) {
             score += 15;
         }
-        if position == 0 || matches!(characters[position - 1], '/' | '-' | '_' | '.') {
+        if position == 0
+            || preceding.is_some_and(|character| matches!(character, '/' | '-' | '_' | '.'))
+        {
             score += 10;
         }
         score -= position as i32;
         previous = Some(position);
-        search_from = position + 1;
+        preceding = Some(query_character);
     }
 
     Some(score)
@@ -1424,13 +1468,13 @@ mod tests {
         let view = PackageView {
             source: PackageSource::Available,
             packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+            folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
             matches: vec![0, 1],
             back: PackageBack::Main,
             selected: vec![true, false],
             notice: None,
             query: String::new(),
             query_cursor: 0,
-            searching: false,
             loading: false,
             details_visible: false,
             details: None,
@@ -1456,13 +1500,13 @@ mod tests {
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Installed,
                 packages: vec!["extra/fzf".to_owned()],
+                folded_packages: vec!["extra/fzf".to_owned()],
                 matches: vec![0],
                 back: PackageBack::RemoveMenu,
                 selected: vec![false],
                 notice: None,
                 query: String::new(),
                 query_cursor: 0,
-                searching: true,
                 loading: false,
                 details_visible: false,
                 details: None,
@@ -1555,17 +1599,17 @@ mod tests {
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+                folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
                 matches: vec![0, 1],
                 back: PackageBack::Main,
                 selected: vec![true, false],
                 notice: None,
                 query: String::new(),
                 query_cursor: 0,
-                searching: true,
                 loading: false,
-                details_visible: false,
-                details: None,
-                details_package: None,
+                details_visible: true,
+                details: Some("Name: bash".to_owned()),
+                details_package: Some("core/bash".to_owned()),
                 details_scroll: 0,
                 scroll_offset: 0,
                 viewport_height: 1,
@@ -1575,17 +1619,19 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.set_package_details("core/bash".to_owned(), "Name: bash".to_owned());
 
         let Screen::Packages(view) = app.screen else {
             panic!("package screen should be preserved");
         };
         assert_eq!(view.query, "fz");
-        assert_eq!(fuzzy_matches(&view.query, &view.packages), vec![1]);
+        assert_eq!(view.matches, vec![1]);
+        assert!(view.details.is_none());
         assert_eq!(selected_packages(&view), vec!["core/bash"]);
     }
 
     #[test]
-    fn space_selects_current_package_and_moves_to_next_match() {
+    fn tab_selects_and_space_searches() {
         let mut app = App {
             cursor: 1,
             main_cursor: 0,
@@ -1598,13 +1644,13 @@ mod tests {
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
                 packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+                folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
                 matches: vec![0, 1],
                 back: PackageBack::Main,
                 selected: vec![false, false],
                 notice: None,
                 query: String::new(),
                 query_cursor: 0,
-                searching: false,
                 loading: false,
                 details_visible: false,
                 details: None,
@@ -1616,6 +1662,7 @@ mod tests {
             should_quit: false,
         };
 
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
         let Screen::Packages(view) = app.screen else {
@@ -1623,6 +1670,7 @@ mod tests {
         };
         assert_eq!(app.cursor, 0);
         assert_eq!(view.selected, vec![false, true]);
+        assert_eq!(view.query, " ");
     }
 
     #[test]

@@ -236,17 +236,7 @@ impl PackageManager {
     fn orphaned_packages(&self) -> Result<PackageList, String> {
         let helper = require_helper(self.helper)?;
         let result = run_capture(helper.command(), &["-Qtdq".to_owned()])?;
-        if !result.success && result.stdout.trim().is_empty() {
-            return Ok(PackageList {
-                packages: Vec::new(),
-                notice: Some("No orphaned packages found.".to_owned()),
-            });
-        }
-        let packages = successful_lines(result, "Could not retrieve orphaned packages")?;
-        Ok(PackageList {
-            packages,
-            notice: None,
-        })
+        orphaned_package_list(result)
     }
 
     fn recent_packages(&self) -> Result<PackageList, String> {
@@ -275,6 +265,24 @@ impl PackageManager {
             notice: None,
         })
     }
+}
+
+fn orphaned_package_list(result: CommandResult) -> Result<PackageList, String> {
+    if !result.success
+        && result.exit_code == Some(1)
+        && result.stdout.trim().is_empty()
+        && result.stderr.trim().is_empty()
+    {
+        return Ok(PackageList {
+            packages: Vec::new(),
+            notice: Some("No orphaned packages found.".to_owned()),
+        });
+    }
+    let packages = successful_lines(result, "Could not retrieve orphaned packages")?;
+    Ok(PackageList {
+        packages,
+        notice: None,
+    })
 }
 
 pub struct CommandResult {
@@ -445,5 +453,26 @@ mod tests {
         assert!(result.success);
         assert_eq!(parse_sync_packages(&result.stdout), vec!["core/bash"]);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn orphan_query_reports_errors_and_accepts_empty_result() {
+        let empty = CommandResult {
+            success: false,
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(orphaned_package_list(empty).unwrap().packages.is_empty());
+
+        let failed = CommandResult {
+            success: false,
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "database unavailable".to_owned(),
+        };
+        assert!(
+            matches!(orphaned_package_list(failed), Err(error) if error.contains("database unavailable"))
+        );
     }
 }

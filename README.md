@@ -39,6 +39,18 @@ Launch the interactive interface:
 pack
 ```
 
+## Themes
+
+On first launch, Pack creates `settings.toml` and `themes/default.toml` in `${XDG_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}/pack/`.
+To add a theme, copy `themes/default.toml` to `themes/mytheme.toml`, edit its colors, and select it in `settings.toml`:
+
+```toml
+[appearance]
+theme = "mytheme"
+```
+
+The theme's `[colors]` section has `selected`, `text`, `muted`, `separator`, and `search` keys. Colors accept names such as `cyan`, palette indexes such as `212`, and hex values such as `"#ff88cc"`. Restart Pack to load changes.
+
 ## Uninstallation
 
 If installed with `makepkg -si`:

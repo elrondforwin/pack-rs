@@ -1,5 +1,6 @@
 mod cache;
 mod package;
+mod theme;
 
 use std::{
     env, io, process,
@@ -20,13 +21,14 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 
 use cache::PackageCache;
 use package::{Action, PackageList, PackageManager, PackageSource};
+use theme::Theme;
 
 const MAIN_MENU: [&str; 5] = [
     "Install Packages",
@@ -74,15 +76,17 @@ fn main() -> io::Result<()> {
     };
 
     let cache = PackageCache::from_environment()?;
+    let theme = Theme::load()?;
     let manager = PackageManager::detect();
     let mut terminal = TerminalSession::start()?;
-    run(&mut terminal, &manager, &cache, route)
+    run(&mut terminal, &manager, &cache, &theme, route)
 }
 
 fn run(
     terminal: &mut TerminalSession,
     manager: &PackageManager,
     cache: &PackageCache,
+    theme: &Theme,
     route: Route,
 ) -> io::Result<()> {
     let mut app = App::new(manager.helper().is_some());
@@ -124,7 +128,7 @@ fn run(
         }
         terminal
             .terminal_mut()
-            .draw(|frame| render(frame, &mut app, manager))?;
+            .draw(|frame| render(frame, &mut app, manager, theme))?;
 
         if event::poll(Duration::from_millis(250))? {
             let request = match event::read()? {
@@ -187,28 +191,28 @@ fn process_request(
     }
 }
 
-fn render(frame: &mut Frame, app: &mut App, manager: &PackageManager) {
+fn render(frame: &mut Frame, app: &mut App, manager: &PackageManager, theme: &Theme) {
     let cursor = app.cursor;
     match &mut app.screen {
-        Screen::Main => render_menu(frame, &MAIN_MENU, cursor),
-        Screen::RemoveMenu => render_menu(frame, &REMOVE_MENU, cursor),
-        Screen::AdvancedMenu => render_menu(frame, advanced_menu(app.yay_available), cursor),
-        Screen::Packages(view) => render_packages(frame, view, cursor),
+        Screen::Main => render_menu(frame, &MAIN_MENU, cursor, theme),
+        Screen::RemoveMenu => render_menu(frame, &REMOVE_MENU, cursor, theme),
+        Screen::AdvancedMenu => render_menu(frame, advanced_menu(app.yay_available), cursor, theme),
+        Screen::Packages(view) => render_packages(frame, view, cursor, theme),
         Screen::Confirm(action) => render_confirmation(frame, action, manager),
         Screen::Output(output) => render_output(frame, output),
     }
 }
 
-fn render_menu(frame: &mut Frame, items: &[&str], cursor: usize) {
+fn render_menu(frame: &mut Frame, items: &[&str], cursor: usize, theme: &Theme) {
     let area = centered_rect(44, items.len() as u16, frame.area());
     for (index, item) in items.iter().enumerate() {
         let selected = index == cursor;
         let style = if selected {
             Style::default()
-                .fg(Color::Indexed(212))
+                .fg(theme.selected)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.text)
         };
         let button_width = item.chars().count() as u16 + 4;
         let button_area = centered_rect(
@@ -223,7 +227,7 @@ fn render_menu(frame: &mut Frame, items: &[&str], cursor: usize) {
     }
 }
 
-fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
+fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize, theme: &Theme) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -236,7 +240,7 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
         frame.render_widget(
             Paragraph::new("Loading packages...")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme.muted)),
             areas[0],
         );
         return;
@@ -251,7 +255,7 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
                 .as_deref()
                 .map_or(String::new(), |notice| format!(" - {notice}"))
         ))
-        .style(Style::default().fg(Color::Gray)),
+        .style(Style::default().fg(theme.text)),
         areas[1],
     );
 
@@ -260,7 +264,7 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(areas[0]);
-        render_package_results(frame, columns[0], view, cursor);
+        render_package_results(frame, columns[0], view, cursor, theme);
         let current = view
             .matches
             .get(cursor)
@@ -274,20 +278,20 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
             Some(_) => "Loading package details...",
         };
         frame.render_widget(
-            Paragraph::new(format_details(details))
-                .style(Style::default().fg(Color::Gray))
+            Paragraph::new(format_details(details, theme))
+                .style(Style::default().fg(theme.text))
                 .scroll((view.details_scroll, 0))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .padding(Padding::uniform(1))
-                        .border_style(Style::default().fg(Color::DarkGray)),
+                        .border_style(Style::default().fg(theme.muted)),
                 )
                 .wrap(Wrap { trim: false }),
             columns[1],
         );
     } else {
-        render_package_results(frame, areas[0], view, cursor);
+        render_package_results(frame, areas[0], view, cursor, theme);
     }
 
     let search = format!(
@@ -296,18 +300,24 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize) {
         &view.query[view.query_cursor..]
     );
     frame.render_widget(
-        Paragraph::new(search).style(Style::default().fg(Color::Cyan)),
+        Paragraph::new(search).style(Style::default().fg(theme.search)),
         areas[2],
     );
 }
 
-fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView, cursor: usize) {
+fn render_package_results(
+    frame: &mut Frame,
+    area: Rect,
+    view: &mut PackageView,
+    cursor: usize,
+    theme: &Theme,
+) {
     view.viewport_height = area.height.max(1) as usize;
     if view.matches.is_empty() {
         frame.render_widget(
             Paragraph::new("No matching packages.")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme.muted)),
             area,
         );
         view.scroll_offset = 0;
@@ -331,7 +341,7 @@ fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView,
         let package_selected = view.selected[*index];
         let style = if cursor_selected || package_selected {
             Style::default()
-                .fg(Color::Indexed(212))
+                .fg(theme.selected)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -339,7 +349,7 @@ fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView,
         let marker_style = if cursor_selected || package_selected {
             style
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.muted)
         };
         let mut spans = vec![Span::styled(
             format!(
@@ -350,14 +360,8 @@ fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView,
             marker_style,
         )];
         if let Some((repository, package_name)) = package.split_once('/') {
-            spans.push(Span::styled(
-                repository,
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                " › ",
-                Style::default().fg(Color::Indexed(240)),
-            ));
+            spans.push(Span::styled(repository, Style::default().fg(theme.muted)));
+            spans.push(Span::styled(" › ", Style::default().fg(theme.separator)));
             spans.push(Span::styled(package_name, style));
         } else {
             spans.push(Span::styled(package.as_str(), style));
@@ -371,7 +375,7 @@ fn render_package_results(frame: &mut Frame, area: Rect, view: &mut PackageView,
     }
 }
 
-fn format_details(details: &str) -> Text<'static> {
+fn format_details(details: &str, theme: &Theme) -> Text<'static> {
     const BASIC_FIELDS: [&str; 12] = [
         "Repository",
         "Name",
@@ -387,9 +391,9 @@ fn format_details(details: &str) -> Text<'static> {
         "Install Date",
     ];
     let key_style = Style::default()
-        .fg(Color::DarkGray)
+        .fg(theme.muted)
         .add_modifier(Modifier::BOLD);
-    let value_style = Style::default().fg(Color::Gray);
+    let value_style = Style::default().fg(theme.text);
     let mut lines = Vec::new();
 
     for line in details.lines() {

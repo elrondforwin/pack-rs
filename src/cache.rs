@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use crate::package::Backend;
+
 pub const CACHE_TTL: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
 #[derive(Debug, Clone)]
@@ -14,13 +16,19 @@ pub struct PackageCache {
 }
 
 impl PackageCache {
-    pub fn from_environment() -> io::Result<Self> {
+    pub fn from_environment(backend: Backend) -> io::Result<Self> {
         let base = env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
             .ok_or_else(|| io::Error::other("XDG_CACHE_HOME veya HOME ayarlı değil"))?;
+        let filename = match backend {
+            Backend::Pacman => "cache-pacman",
+            Backend::Yay => "cache-yay",
+            // Earlier formats lack repository metadata (or contain concatenated DNF5 records).
+            Backend::Dnf => "cache-dnf-v3",
+        };
         Ok(Self {
-            path: base.join("pack").join("cache"),
+            path: base.join("pack").join(filename),
         })
     }
 

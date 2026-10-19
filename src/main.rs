@@ -1,4 +1,5 @@
 mod cache;
+mod config;
 mod package;
 mod theme;
 
@@ -27,7 +28,7 @@ use ratatui::{
 };
 
 use cache::PackageCache;
-use package::{Action, PackageList, PackageManager, PackageSource};
+use package::{Action, Backend, PackageList, PackageManager, PackageSource};
 use theme::Theme;
 
 const MAIN_MENU: [&str; 5] = [
@@ -44,19 +45,19 @@ const REMOVE_MENU: [&str; 5] = [
     "Orphaned Packages",
     "Back",
 ];
-const ADVANCED_MENU_WITH_YAY: [&str; 4] = [
-    "Clear Helper Cache",
-    "Refresh Pack Cache",
-    "Refresh Pack Cache (without AUR)",
+const REMOVE_MENU_WITHOUT_AUR: [&str; 4] = [
+    "All Installed Packages",
+    "Recently Installed Packages",
+    "Orphaned Packages",
     "Back",
 ];
-const ADVANCED_MENU_WITHOUT_YAY: [&str; 2] = ["Refresh Pack Cache (without AUR)", "Back"];
+const ADVANCED_MENU: [&str; 3] = ["Clear Package Manager Cache", "Refresh Pack Cache", "Back"];
 
-fn advanced_menu(yay_available: bool) -> &'static [&'static str] {
-    if yay_available {
-        &ADVANCED_MENU_WITH_YAY
+fn remove_menu(aur: bool) -> &'static [&'static str] {
+    if aur {
+        &REMOVE_MENU
     } else {
-        &ADVANCED_MENU_WITHOUT_YAY
+        &REMOVE_MENU_WITHOUT_AUR
     }
 }
 
@@ -75,9 +76,11 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let cache = PackageCache::from_environment()?;
-    let theme = Theme::load()?;
-    let manager = PackageManager::detect();
+    let settings = config::Settings::load()?;
+    let theme = Theme::load(&settings)?;
+    let manager = PackageManager::new(settings.package_manager, settings.directory)
+        .map_err(io::Error::other)?;
+    let cache = PackageCache::from_environment(manager.backend())?;
     let mut terminal = TerminalSession::start()?;
     run(&mut terminal, &manager, &cache, &theme, route)
 }
@@ -89,7 +92,7 @@ fn run(
     theme: &Theme,
     route: Route,
 ) -> io::Result<()> {
-    let mut app = App::new(manager.helper().is_some());
+    let mut app = App::new(manager.supports_aur());
     match route {
         Route::Tui => {}
         Route::Install => process_request(
@@ -168,8 +171,7 @@ fn process_request(
             app.start_details_loading(manager, package, installed);
         }
         Request::Execute(action) => match action {
-            Action::RefreshCache { without_aur } => match manager.refresh_cache(cache, without_aur)
-            {
+            Action::RefreshCache => match manager.refresh_cache(cache) {
                 Ok(count) => app.show_output(
                     action.title(),
                     format!(
@@ -195,9 +197,9 @@ fn render(frame: &mut Frame, app: &mut App, manager: &PackageManager, theme: &Th
     let cursor = app.cursor;
     match &mut app.screen {
         Screen::Main => render_menu(frame, &MAIN_MENU, cursor, theme),
-        Screen::RemoveMenu => render_menu(frame, &REMOVE_MENU, cursor, theme),
-        Screen::AdvancedMenu => render_menu(frame, advanced_menu(app.yay_available), cursor, theme),
-        Screen::Packages(view) => render_packages(frame, view, cursor, theme),
+        Screen::RemoveMenu => render_menu(frame, remove_menu(app.aur_enabled), cursor, theme),
+        Screen::AdvancedMenu => render_menu(frame, &ADVANCED_MENU, cursor, theme),
+        Screen::Packages(view) => render_packages(frame, view, cursor, manager.backend(), theme),
         Screen::Confirm(action) => render_confirmation(frame, action, manager),
         Screen::Output(output) => render_output(frame, output),
     }
@@ -227,7 +229,13 @@ fn render_menu(frame: &mut Frame, items: &[&str], cursor: usize, theme: &Theme) 
     }
 }
 
-fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize, theme: &Theme) {
+fn render_packages(
+    frame: &mut Frame,
+    view: &mut PackageView,
+    cursor: usize,
+    backend: Backend,
+    theme: &Theme,
+) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -264,7 +272,7 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize, the
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(areas[0]);
-        render_package_results(frame, columns[0], view, cursor, theme);
+        render_package_results(frame, columns[0], view, cursor, backend, theme);
         let current = view
             .matches
             .get(cursor)
@@ -291,7 +299,7 @@ fn render_packages(frame: &mut Frame, view: &mut PackageView, cursor: usize, the
             columns[1],
         );
     } else {
-        render_package_results(frame, areas[0], view, cursor, theme);
+        render_package_results(frame, areas[0], view, cursor, backend, theme);
     }
 
     let search = format!(
@@ -310,6 +318,7 @@ fn render_package_results(
     area: Rect,
     view: &mut PackageView,
     cursor: usize,
+    backend: Backend,
     theme: &Theme,
 ) {
     view.viewport_height = area.height.max(1) as usize;
@@ -359,13 +368,7 @@ fn render_package_results(
             ),
             marker_style,
         )];
-        if let Some((repository, package_name)) = package.split_once('/') {
-            spans.push(Span::styled(repository, Style::default().fg(theme.muted)));
-            spans.push(Span::styled(" › ", Style::default().fg(theme.separator)));
-            spans.push(Span::styled(package_name, style));
-        } else {
-            spans.push(Span::styled(package.as_str(), style));
-        }
+        spans.extend(package_label(package, backend, style, theme).spans);
         let line = Line::from(spans);
         let y = area.y + area.height - 1 - row as u16;
         frame.render_widget(
@@ -373,6 +376,27 @@ fn render_package_results(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn package_label<'a>(package: &'a str, backend: Backend, style: Style, theme: &Theme) -> Line<'a> {
+    let muted = Style::default().fg(theme.muted);
+    let mut spans = Vec::new();
+    let name = if let Some((repository, name)) = package.split_once('/') {
+        spans.push(Span::styled(repository, muted));
+        spans.push(Span::styled(" › ", Style::default().fg(theme.separator)));
+        name
+    } else {
+        package
+    };
+    if backend == Backend::Dnf
+        && let Some((name, arch)) = name.rsplit_once('.')
+    {
+        spans.push(Span::styled(name, style));
+        spans.push(Span::styled(format!(" {arch}"), muted));
+    } else {
+        spans.push(Span::styled(name, style));
+    }
+    Line::from(spans)
 }
 
 fn format_details(details: &str, theme: &Theme) -> Text<'static> {
@@ -427,9 +451,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn render_confirmation(frame: &mut Frame, action: &Action, manager: &PackageManager) {
-    let command = action
-        .command_preview(manager.helper())
-        .unwrap_or_else(|error| error);
+    let command = manager.command_preview(action);
     let content = format!(
         "{}\n\nCommand to run:\n{command}\n\ny: confirm  n/Esc: cancel",
         action.summary()
@@ -454,7 +476,7 @@ struct App {
     main_cursor: usize,
     remove_cursor: usize,
     advanced_cursor: usize,
-    yay_available: bool,
+    aur_enabled: bool,
     loading: Option<LoadingTask>,
     details_loading: Option<DetailsTask>,
     details_debounce: Option<Instant>,
@@ -463,13 +485,13 @@ struct App {
 }
 
 impl App {
-    fn new(yay_available: bool) -> Self {
+    fn new(aur_enabled: bool) -> Self {
         Self {
             cursor: 0,
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
-            yay_available,
+            aur_enabled,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -501,13 +523,18 @@ impl App {
             Screen::RemoveMenu => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Esc => next_screen = Some(Screen::Main),
-                KeyCode::Up | KeyCode::Char('k') => previous(&mut self.cursor, REMOVE_MENU.len()),
-                KeyCode::Down | KeyCode::Char('j') => next(&mut self.cursor, REMOVE_MENU.len()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    previous(&mut self.cursor, remove_menu(self.aur_enabled).len())
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    next(&mut self.cursor, remove_menu(self.aur_enabled).len())
+                }
                 KeyCode::Enter => match self.cursor {
                     0 => request = Some(Request::Load(PackageSource::Installed)),
                     1 => request = Some(Request::Load(PackageSource::Recent)),
-                    2 => request = Some(Request::Load(PackageSource::Aur)),
-                    3 => request = Some(Request::Load(PackageSource::Orphaned)),
+                    2 if self.aur_enabled => request = Some(Request::Load(PackageSource::Aur)),
+                    2 => request = Some(Request::Load(PackageSource::Orphaned)),
+                    3 if self.aur_enabled => request = Some(Request::Load(PackageSource::Orphaned)),
                     _ => next_screen = Some(Screen::Main),
                 },
                 _ => {}
@@ -515,39 +542,13 @@ impl App {
             Screen::AdvancedMenu => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Esc => next_screen = Some(Screen::Main),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    previous(&mut self.cursor, advanced_menu(self.yay_available).len())
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    next(&mut self.cursor, advanced_menu(self.yay_available).len())
-                }
-                KeyCode::Enter => {
-                    if self.yay_available {
-                        match self.cursor {
-                            0 => next_screen = Some(Screen::Confirm(Action::ClearHelperCache)),
-                            1 => {
-                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
-                                    without_aur: false,
-                                }))
-                            }
-                            2 => {
-                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
-                                    without_aur: true,
-                                }))
-                            }
-                            _ => next_screen = Some(Screen::Main),
-                        }
-                    } else {
-                        match self.cursor {
-                            0 => {
-                                next_screen = Some(Screen::Confirm(Action::RefreshCache {
-                                    without_aur: true,
-                                }))
-                            }
-                            _ => next_screen = Some(Screen::Main),
-                        }
-                    }
-                }
+                KeyCode::Up | KeyCode::Char('k') => previous(&mut self.cursor, ADVANCED_MENU.len()),
+                KeyCode::Down | KeyCode::Char('j') => next(&mut self.cursor, ADVANCED_MENU.len()),
+                KeyCode::Enter => match self.cursor {
+                    0 => next_screen = Some(Screen::Confirm(Action::ClearPackageCache)),
+                    1 => next_screen = Some(Screen::Confirm(Action::RefreshCache)),
+                    _ => next_screen = Some(Screen::Main),
+                },
                 _ => {}
             },
             Screen::Packages(view) if view.loading => match key.code {
@@ -1257,11 +1258,29 @@ fn is_aur_package(candidate: &str) -> bool {
 }
 
 fn is_exact_package_name(query: &str, candidate: &str) -> bool {
+    let name = candidate
+        .rsplit_once('/')
+        .map_or(candidate, |(_, name)| name);
     !query.is_empty()
-        && candidate
-            .rsplit_once('/')
-            .map_or(candidate, |(_, package_name)| package_name)
-            .eq_ignore_ascii_case(query)
+        && (name.eq_ignore_ascii_case(query)
+            || name.rsplit_once('.').is_some_and(|(name, arch)| {
+                matches!(
+                    arch,
+                    "x86_64"
+                        | "i686"
+                        | "i586"
+                        | "i486"
+                        | "i386"
+                        | "noarch"
+                        | "aarch64"
+                        | "armv7hl"
+                        | "armv6hl"
+                        | "ppc64le"
+                        | "ppc64"
+                        | "s390x"
+                        | "riscv64"
+                ) && name.eq_ignore_ascii_case(query)
+            }))
 }
 
 fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
@@ -1450,6 +1469,70 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
+    fn dnf_repository_and_architecture_stay_muted_when_the_package_is_selected() {
+        use ratatui::{buffer::Buffer, style::Color, widgets::Widget};
+        let theme = Theme {
+            selected: Color::Magenta,
+            text: Color::Gray,
+            muted: Color::DarkGray,
+            separator: Color::DarkGray,
+            search: Color::Cyan,
+        };
+        let style = Style::default()
+            .fg(theme.selected)
+            .add_modifier(Modifier::BOLD);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 50, 1));
+        Paragraph::new(package_label(
+            "updates/python3.13.x86_64",
+            Backend::Dnf,
+            style,
+            &theme,
+        ))
+        .style(style)
+        .render(buffer.area, &mut buffer);
+        let rendered = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.starts_with("updates › python3.13 x86_64"));
+        assert_eq!(buffer[(0, 0)].fg, theme.muted);
+        assert_eq!(
+            buffer[("updates › ".chars().count() as u16, 0)].fg,
+            theme.selected
+        );
+        assert_eq!(
+            buffer[("updates › python3.13 ".chars().count() as u16, 0)].fg,
+            theme.muted
+        );
+
+        let arch = package_label("extra/python3.13", Backend::Pacman, style, &theme);
+        assert_eq!(arch.to_string(), "extra › python3.13");
+    }
+
+    #[test]
+    fn remove_menu_routes_orphans_and_back_without_aur() {
+        let mut app = App::new(false);
+        app.screen = Screen::RemoveMenu;
+        app.cursor = 2;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Request::Load(PackageSource::Orphaned))
+        ));
+        app.screen = Screen::RemoveMenu;
+        app.cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.screen, Screen::Main));
+        let mut app = App::new(true);
+        app.screen = Screen::RemoveMenu;
+        app.cursor = 2;
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Request::Load(PackageSource::Aur))
+        ));
+    }
+
+    #[test]
     fn menu_cursor_wraps_at_both_ends() {
         let mut cursor = 0;
         previous(&mut cursor, MAIN_MENU.len());
@@ -1459,12 +1542,13 @@ mod tests {
     }
 
     #[test]
-    fn advanced_menu_hides_aur_refresh_without_yay() {
+    fn menus_only_offer_aur_for_yay_and_have_one_refresh() {
+        assert!(!remove_menu(false).contains(&"Installed AUR Packages"));
+        assert!(remove_menu(true).contains(&"Installed AUR Packages"));
         assert_eq!(
-            advanced_menu(false),
-            &["Refresh Pack Cache (without AUR)", "Back"]
+            ADVANCED_MENU,
+            ["Clear Package Manager Cache", "Refresh Pack Cache", "Back"]
         );
-        assert_eq!(advanced_menu(true).len(), 4);
     }
 
     #[test]
@@ -1497,7 +1581,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 1,
             advanced_cursor: 0,
-            yay_available: false,
+            aur_enabled: false,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -1556,6 +1640,18 @@ mod tests {
     }
 
     #[test]
+    fn dnf_exact_name_matches_architectures_before_longer_names() {
+        let packages = vec![
+            "bash-completion.noarch".to_owned(),
+            "bash.x86_64".to_owned(),
+            "bash.i686".to_owned(),
+        ];
+        assert_eq!(fuzzy_matches("bash", &packages), vec![1, 2, 0]);
+        assert!(is_exact_package_name("bash.x86_64", "bash.x86_64"));
+        assert!(!is_exact_package_name("python3", "python3.13"));
+    }
+
+    #[test]
     fn exact_package_name_beats_fuzzy_matches() {
         let packages = vec![
             "extra/discord-account-manager-git".to_owned(),
@@ -1596,7 +1692,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
-            yay_available: false,
+            aur_enabled: false,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -1641,7 +1737,7 @@ mod tests {
             main_cursor: 0,
             remove_cursor: 0,
             advanced_cursor: 0,
-            yay_available: false,
+            aur_enabled: false,
             loading: None,
             details_loading: None,
             details_debounce: None,

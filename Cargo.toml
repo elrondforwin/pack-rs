@@ -2,7 +2,8 @@
 name = "pack"
 version = "0.1.0"
 edition = "2024"
-description = "A Ratatui-based Arch Linux package manager TUI"
+rust-version = "1.88"
+description = "A Ratatui-based Arch Linux and Fedora package manager TUI"
 license = "GPL-3.0-only"
 
 [dependencies]

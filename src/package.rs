@@ -6,7 +6,10 @@ use std::{
     process::Command,
 };
 
-use crate::cache::PackageCache;
+use crate::{
+    cache::PackageCache,
+    flatpak::{Catalog, FlatpakPackage, Scope},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagerChoice {
@@ -33,6 +36,7 @@ pub enum Backend {
     Pacman,
     Yay,
     Dnf,
+    Flatpak,
 }
 
 impl Backend {
@@ -41,6 +45,7 @@ impl Backend {
             Self::Pacman => "pacman",
             Self::Yay => "yay",
             Self::Dnf => "dnf",
+            Self::Flatpak => "flatpak",
         }
     }
 }
@@ -111,9 +116,75 @@ impl PackageSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Package {
+    System(String),
+    Flatpak(Box<FlatpakPackage>),
+}
+
+impl Package {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::System(name) => name,
+            Self::Flatpak(app) => app.identifier(),
+        }
+    }
+
+    pub fn search_text(&self) -> String {
+        match self {
+            Self::System(name) => name.clone(),
+            Self::Flatpak(app) => format!(
+                "{} {} {} {} {} flatpak",
+                app.name,
+                app.identifier(),
+                app.arch(),
+                app.branch(),
+                app.scope.name()
+            ),
+        }
+    }
+}
+
+impl AsRef<str> for Package {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl From<String> for Package {
+    fn from(name: String) -> Self {
+        Self::System(name)
+    }
+}
+impl From<FlatpakPackage> for Package {
+    fn from(app: FlatpakPackage) -> Self {
+        Self::Flatpak(Box::new(app))
+    }
+}
+
+impl std::fmt::Display for Package {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System(name) => formatter.write_str(name),
+            Self::Flatpak(app) => write!(
+                formatter,
+                "{} (Flatpak, {}, {}, {})",
+                app.name,
+                app.remote,
+                app.scope.name(),
+                app.reference
+            ),
+        }
+    }
+}
+
+pub struct PackageList {
+    pub packages: Vec<Package>,
+    pub notice: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Install(Vec<String>),
-    Remove(Vec<String>),
+    Install(Vec<Package>),
+    Remove(Vec<Package>),
     UpdateSystem,
     ClearPackageCache,
     RefreshCache,
@@ -135,14 +206,22 @@ impl Action {
             Self::Install(packages) => format!(
                 "{} packages will be installed:\n{}",
                 packages.len(),
-                packages.join("\n")
+                packages
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
             Self::Remove(packages) => format!(
                 "{} packages will be removed:\n{}\n\nThis may also remove configuration files and unneeded dependencies.",
                 packages.len(),
-                packages.join("\n")
+                packages
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
-            Self::UpdateSystem => "System packages will be updated.".to_owned(),
+            Self::UpdateSystem => "Available package updates will be applied.".to_owned(),
             Self::ClearPackageCache => {
                 "The selected package manager's cache will be cleared.".to_owned()
             }
@@ -154,7 +233,7 @@ impl Action {
     }
 }
 
-pub struct PackageList {
+pub struct NativePackageList {
     pub packages: Vec<String>,
     pub notice: Option<String>,
 }
@@ -163,14 +242,33 @@ pub struct PackageList {
 pub struct PackageManager {
     backend: Backend,
     settings_directory: PathBuf,
+    flatpak: Option<Catalog>,
 }
 
 impl PackageManager {
-    pub fn new(choice: ManagerChoice, settings_directory: PathBuf) -> Result<Self, String> {
+    pub fn new(
+        choice: ManagerChoice,
+        settings_directory: PathBuf,
+        flatpak_enabled: bool,
+    ) -> Result<Self, String> {
         let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let flatpak = if flatpak_enabled {
+            if !command_exists("flatpak") {
+                return Err("Flatpak is enabled, but flatpak was not found on PATH.".to_owned());
+            }
+            Some(Catalog::new()?)
+        } else {
+            None
+        };
+        let backend = match resolve_backend(choice, &os_release, command_exists) {
+            Ok(backend) => backend,
+            Err(_) if choice == ManagerChoice::Auto && flatpak_enabled => Backend::Flatpak,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
-            backend: resolve_backend(choice, &os_release, command_exists)?,
+            backend,
             settings_directory,
+            flatpak,
         })
     }
 
@@ -182,7 +280,107 @@ impl PackageManager {
         self.backend == Backend::Yay
     }
 
+    pub fn cache_is_fresh(&self, cache: &PackageCache) -> bool {
+        (self.backend == Backend::Flatpak || cache.is_fresh())
+            && self.flatpak.as_ref().is_none_or(Catalog::is_fresh)
+    }
+
     pub fn list(&self, cache: &PackageCache, source: PackageSource) -> Result<PackageList, String> {
+        let native = self.native_list(cache, source);
+        let mut notices = Vec::new();
+        let mut packages = Vec::new();
+        match native {
+            Ok(list) => {
+                packages.extend(list.packages.into_iter().map(Package::System));
+                if let Some(notice) = list.notice {
+                    notices.push(notice);
+                }
+            }
+            Err(error) => {
+                if self.flatpak.is_none()
+                    || !matches!(source, PackageSource::Available | PackageSource::Installed)
+                {
+                    return Err(error);
+                }
+                notices.push(format!("System packages: {error}"));
+            }
+        }
+        if let Some(catalog) = &self.flatpak {
+            let flatpak = match source {
+                PackageSource::Available => Some(catalog.available()),
+                PackageSource::Installed => {
+                    Some(Catalog::query(true).map(|packages| (packages, None)))
+                }
+                _ => None,
+            };
+            if let Some(result) = flatpak {
+                match result {
+                    Ok((apps, notice)) => {
+                        packages.extend(apps.into_iter().map(Package::from));
+                        if let Some(notice) = notice {
+                            notices.push(notice);
+                        }
+                    }
+                    Err(error) => notices.push(format!("Flatpak: {error}")),
+                }
+            }
+        }
+        if packages.is_empty() && !notices.is_empty() {
+            return Err(notices.join("\n"));
+        }
+        Ok(PackageList {
+            packages,
+            notice: (!notices.is_empty()).then(|| notices.join("; ")),
+        })
+    }
+
+    pub fn package_info(
+        &self,
+        package: &Package,
+        installed: bool,
+    ) -> Result<CommandResult, String> {
+        match package {
+            Package::System(package) => self.native_package_info(package, installed),
+            Package::Flatpak(app) => app.info(installed),
+        }
+    }
+
+    pub fn refresh_cache(&self, cache: &PackageCache) -> Result<usize, String> {
+        let mut count = 0;
+        let mut errors = Vec::new();
+        if self.backend != Backend::Flatpak {
+            match self.refresh_native_cache(cache) {
+                Ok(size) => count += size,
+                Err(error) => errors.push(format!("System cache: {error}")),
+            }
+        }
+        if let Some(catalog) = &self.flatpak {
+            match catalog.refresh() {
+                Ok(size) => count += size,
+                Err(error) => errors.push(format!("Flatpak cache: {error}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(count)
+        } else {
+            Err(format!(
+                "Refreshed {count} packages, but some caches failed:\n{}",
+                errors.join("\n")
+            ))
+        }
+    }
+
+    fn native_list(
+        &self,
+        cache: &PackageCache,
+        source: PackageSource,
+    ) -> Result<NativePackageList, String> {
+        if self.backend == Backend::Flatpak {
+            return Ok(NativePackageList {
+                packages: Vec::new(),
+                notice: None,
+            });
+        }
         match source {
             PackageSource::Available => self.available_packages(cache),
             PackageSource::Installed => self.query_packages(source),
@@ -195,7 +393,7 @@ impl PackageManager {
         }
     }
 
-    pub fn package_info(&self, package: &str, installed: bool) -> Result<CommandResult, String> {
+    fn native_package_info(&self, package: &str, installed: bool) -> Result<CommandResult, String> {
         let args = if self.backend == Backend::Dnf {
             let (repository, package) = package
                 .rsplit_once('/')
@@ -254,7 +452,7 @@ impl PackageManager {
         }
     }
 
-    pub fn refresh_cache(&self, cache: &PackageCache) -> Result<usize, String> {
+    fn refresh_native_cache(&self, cache: &PackageCache) -> Result<usize, String> {
         // Read this only when rebuilding the DNF cache, never when displaying a cached list.
         let blacklist = if self.backend == Backend::Dnf {
             crate::config::load_fedora_architecture_blacklist(&self.settings_directory)
@@ -295,6 +493,16 @@ impl PackageManager {
         action: &Action,
         root: bool,
     ) -> Result<(String, Vec<String>), String> {
+        if self.backend == Backend::Flatpak {
+            return Err("No native package manager is configured.".to_owned());
+        }
+        if matches!(action, Action::Install(packages) | Action::Remove(packages) if packages.iter().any(|package| matches!(package, Package::Flatpak(_))))
+        {
+            return Err(
+                "Flatpak selections must be routed through the Flatpak transaction plan."
+                    .to_owned(),
+            );
+        }
         let dnf = self.backend == Backend::Dnf;
         let args = match action {
             Action::Install(packages) => {
@@ -324,51 +532,138 @@ impl PackageManager {
         }
     }
 
-    pub fn command_preview(&self, action: &Action) -> String {
-        let (program, args) = if matches!(action, Action::RefreshCache) {
-            (
-                self.backend.command().to_owned(),
-                self.query_args(PackageSource::Available),
-            )
-        } else {
-            self.interactive_command(action, running_as_root())
-                .expect("interactive action")
-        };
-        std::iter::once(program)
-            .chain(args)
-            .map(|arg| {
-                if arg.chars().any(char::is_whitespace) {
-                    format!("{arg:?}")
-                } else {
-                    arg
+    fn transaction_commands(
+        &self,
+        action: &Action,
+        root: bool,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        let mut commands = Vec::new();
+        match action {
+            Action::Install(packages) | Action::Remove(packages) => {
+                let install = matches!(action, Action::Install(_));
+                let native = packages
+                    .iter()
+                    .filter(|package| matches!(package, Package::System(_)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !native.is_empty() {
+                    commands.push(self.interactive_command(
+                        &if install {
+                            Action::Install(native)
+                        } else {
+                            Action::Remove(native)
+                        },
+                        root,
+                    )?);
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+                let mut groups: Vec<(Scope, String, Vec<String>)> = Vec::new();
+                for package in packages {
+                    let Package::Flatpak(app) = package else {
+                        continue;
+                    };
+                    if self.flatpak.is_none() {
+                        return Err("Flatpak support is disabled.".to_owned());
+                    }
+                    let remote = if install { app.remote.as_str() } else { "" };
+                    if let Some((_, _, refs)) = groups
+                        .iter_mut()
+                        .find(|(scope, origin, _)| *scope == app.scope && origin == remote)
+                    {
+                        if !refs.contains(&app.reference) {
+                            refs.push(app.reference.clone());
+                        }
+                    } else {
+                        groups.push((app.scope, remote.to_owned(), vec![app.reference.clone()]));
+                    }
+                }
+                for (scope, remote, refs) in groups {
+                    let mut args = strings(&[
+                        if install { "install" } else { "uninstall" },
+                        scope.flag(),
+                        "--",
+                    ]);
+                    if install {
+                        args.push(remote);
+                    }
+                    args.extend(refs);
+                    commands.push(("flatpak".to_owned(), args));
+                }
+            }
+            Action::UpdateSystem => {
+                if self.backend != Backend::Flatpak {
+                    commands.push(self.interactive_command(action, root)?);
+                }
+                if self.flatpak.is_some() {
+                    for scope in Scope::ALL {
+                        commands.push(("flatpak".to_owned(), strings(&["update", scope.flag()])));
+                    }
+                }
+            }
+            Action::RefreshCache => {
+                if self.backend != Backend::Flatpak {
+                    commands.push((
+                        self.backend.command().to_owned(),
+                        self.query_args(PackageSource::Available),
+                    ));
+                }
+                if self.flatpak.is_some() {
+                    for scope in Scope::ALL {
+                        commands.push(("flatpak".to_owned(), Catalog::query_args(scope, false)));
+                    }
+                }
+            }
+            _ => commands.push(self.interactive_command(action, root)?),
+        }
+        Ok(commands)
     }
 
-    pub fn run_interactive(&self, action: &Action) -> Result<String, String> {
-        let (program, args) = self.interactive_command(action, running_as_root())?;
-        let status = Command::new(&program)
-            .args(&args)
-            .status()
-            .map_err(|error| format!("Could not run {program}: {error}"))?;
-        if status.success() {
-            Ok(format!(
-                "{} completed (exit code {}).",
-                action.title(),
-                exit_code(&status)
-            ))
-        } else {
-            Err(format!(
-                "{} failed (exit code {}).",
-                action.title(),
-                exit_code(&status)
-            ))
+    pub fn command_preview(&self, action: &Action) -> String {
+        match self.transaction_commands(action, running_as_root()) {
+            Ok(commands) => commands
+                .into_iter()
+                .map(|(program, args)| command_text(&program, &args))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => error,
         }
     }
 
-    fn query_packages(&self, source: PackageSource) -> Result<PackageList, String> {
+    pub fn run_interactive(&self, action: &Action) -> Result<String, String> {
+        if matches!(action, Action::RefreshCache) {
+            return Err("Cache refresh uses captured output.".to_owned());
+        }
+        let commands = self.transaction_commands(action, running_as_root())?;
+        let mut completed = Vec::new();
+        for (program, args) in commands {
+            let command = command_text(&program, &args);
+            println!("Running: {command}");
+            let result = Command::new(&program).args(&args).status();
+            match result {
+                Ok(status) if status.success() => completed.push(command),
+                result => {
+                    let reason = match result {
+                        Ok(status) => format!("exit code {}", exit_code(&status)),
+                        Err(error) => error.to_string(),
+                    };
+                    return Err(format!(
+                        "Failed: {command} ({reason}).\nCompleted: {}\nRemaining commands were not run.",
+                        if completed.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            completed.join("; ")
+                        }
+                    ));
+                }
+            }
+        }
+        Ok(format!(
+            "{} completed:\n{}",
+            action.title(),
+            completed.join("\n")
+        ))
+    }
+
+    fn query_packages(&self, source: PackageSource) -> Result<NativePackageList, String> {
         let args = self.query_args(source);
         let result = run_capture(self.backend.command(), &args)?;
         let context = "Could not retrieve the package list";
@@ -377,17 +672,17 @@ impl PackageManager {
         } else {
             successful_lines(result, context)?
         };
-        Ok(PackageList {
+        Ok(NativePackageList {
             packages,
             notice: None,
         })
     }
 
-    fn available_packages(&self, cache: &PackageCache) -> Result<PackageList, String> {
+    fn available_packages(&self, cache: &PackageCache) -> Result<NativePackageList, String> {
         if cache.is_fresh() {
             return cache
                 .read()
-                .map(|packages| PackageList {
+                .map(|packages| NativePackageList {
                     packages,
                     notice: None,
                 })
@@ -395,15 +690,15 @@ impl PackageManager {
         }
 
         let stale = cache.read().ok().filter(|packages| !packages.is_empty());
-        match self.refresh_cache(cache) {
+        match self.refresh_native_cache(cache) {
             Ok(_) => cache
                 .read()
-                .map(|packages| PackageList {
+                .map(|packages| NativePackageList {
                     packages,
                     notice: None,
                 })
                 .map_err(|error| format!("Could not read cache: {error}")),
-            Err(error) if stale.is_some() => Ok(PackageList {
+            Err(error) if stale.is_some() => Ok(NativePackageList {
                 packages: stale.unwrap(),
                 notice: Some(format!(
                     "Could not refresh cache; using the stale list: {error}"
@@ -413,7 +708,7 @@ impl PackageManager {
         }
     }
 
-    fn orphaned_packages(&self) -> Result<PackageList, String> {
+    fn orphaned_packages(&self) -> Result<NativePackageList, String> {
         if self.backend == Backend::Dnf {
             self.query_packages(PackageSource::Orphaned)
         } else {
@@ -425,7 +720,7 @@ impl PackageManager {
         }
     }
 
-    fn recent_packages(&self) -> Result<PackageList, String> {
+    fn recent_packages(&self) -> Result<NativePackageList, String> {
         if self.backend == Backend::Dnf {
             return self.query_packages(PackageSource::Recent);
         }
@@ -437,11 +732,25 @@ impl PackageManager {
             ));
         }
 
-        Ok(PackageList {
+        Ok(NativePackageList {
             packages: parse_recent_packages(&result.stdout),
             notice: None,
         })
     }
+}
+
+fn command_text(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_owned())
+        .chain(args.iter().cloned())
+        .map(|arg| {
+            if arg.chars().any(char::is_whitespace) {
+                format!("{arg:?}")
+            } else {
+                arg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_recent_packages(output: &str) -> Vec<String> {
@@ -514,19 +823,19 @@ fn parse_dnf_packages(output: &str, source: PackageSource) -> Result<Vec<String>
     Ok(packages)
 }
 
-fn orphaned_package_list(result: CommandResult) -> Result<PackageList, String> {
+fn orphaned_package_list(result: CommandResult) -> Result<NativePackageList, String> {
     if !result.success
         && result.exit_code == Some(1)
         && result.stdout.trim().is_empty()
         && result.stderr.trim().is_empty()
     {
-        return Ok(PackageList {
+        return Ok(NativePackageList {
             packages: Vec::new(),
             notice: Some("No orphaned packages found.".to_owned()),
         });
     }
     let packages = successful_lines(result, "Could not retrieve orphaned packages")?;
-    Ok(PackageList {
+    Ok(NativePackageList {
         packages,
         notice: None,
     })
@@ -558,7 +867,7 @@ impl CommandResult {
     }
 }
 
-fn run_capture(program: &str, args: &[String]) -> Result<CommandResult, String> {
+pub(crate) fn run_capture(program: &str, args: &[String]) -> Result<CommandResult, String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -617,17 +926,18 @@ fn deduplicate(packages: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn package_args(operation: &str, packages: &[String], backend: Backend) -> Vec<String> {
+fn package_args(operation: &str, packages: &[Package], backend: Backend) -> Vec<String> {
     [operation.to_owned(), "--".to_owned()]
         .into_iter()
         .chain(packages.iter().map(|package| {
             if backend == Backend::Dnf {
                 package
+                    .as_str()
                     .rsplit_once('/')
                     .map_or(package.as_str(), |(_, name)| name)
                     .to_owned()
             } else {
-                package.clone()
+                package.as_str().to_owned()
             }
         }))
         .collect()
@@ -656,7 +966,7 @@ fn command_error(result: CommandResult, context: &str) -> String {
     }
 }
 
-fn strings(args: &[&str]) -> Vec<String> {
+pub(crate) fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_owned()).collect()
 }
 
@@ -691,6 +1001,122 @@ fn exit_code(status: &std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn system_packages(names: &[&str]) -> Vec<Package> {
+        names
+            .iter()
+            .map(|name| Package::System((*name).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn mixed_transactions_keep_flatpak_scope_origin_architecture_and_branch() {
+        let manager = PackageManager {
+            backend: Backend::Pacman,
+            settings_directory: PathBuf::new(),
+            flatpak: Some(Catalog::new().unwrap()),
+        };
+        let packages = vec![
+            Package::System("extra/fzf".to_owned()),
+            Package::from(
+                FlatpakPackage::parse(
+                    Scope::User,
+                    "flathub\tapp/org.example.Shared/x86_64/stable\tShared App",
+                )
+                .unwrap(),
+            ),
+            Package::from(
+                FlatpakPackage::parse(
+                    Scope::User,
+                    "testing\tapp/org.example.Shared/aarch64/beta\tShared App",
+                )
+                .unwrap(),
+            ),
+            Package::from(
+                FlatpakPackage::parse(
+                    Scope::System,
+                    "flathub\tapp/org.example.Shared/x86_64/stable\tShared App",
+                )
+                .unwrap(),
+            ),
+        ];
+        let action = Action::Install(packages.clone());
+        assert!(manager.interactive_command(&action, false).is_err());
+        assert_eq!(
+            manager.transaction_commands(&action, false).unwrap(),
+            vec![
+                (
+                    "sudo".to_owned(),
+                    strings(&["pacman", "-S", "--", "extra/fzf"])
+                ),
+                (
+                    "flatpak".to_owned(),
+                    strings(&[
+                        "install",
+                        "--user",
+                        "--",
+                        "flathub",
+                        "app/org.example.Shared/x86_64/stable"
+                    ])
+                ),
+                (
+                    "flatpak".to_owned(),
+                    strings(&[
+                        "install",
+                        "--user",
+                        "--",
+                        "testing",
+                        "app/org.example.Shared/aarch64/beta"
+                    ])
+                ),
+                (
+                    "flatpak".to_owned(),
+                    strings(&[
+                        "install",
+                        "--system",
+                        "--",
+                        "flathub",
+                        "app/org.example.Shared/x86_64/stable"
+                    ])
+                ),
+            ]
+        );
+        let remove = manager
+            .transaction_commands(&Action::Remove(packages), false)
+            .unwrap();
+        assert_eq!(
+            remove[0],
+            (
+                "sudo".to_owned(),
+                strings(&["pacman", "-Rns", "--", "extra/fzf"])
+            )
+        );
+        assert_eq!(
+            remove[1],
+            (
+                "flatpak".to_owned(),
+                strings(&[
+                    "uninstall",
+                    "--user",
+                    "--",
+                    "app/org.example.Shared/x86_64/stable",
+                    "app/org.example.Shared/aarch64/beta"
+                ])
+            )
+        );
+        assert_eq!(
+            remove[2],
+            (
+                "flatpak".to_owned(),
+                strings(&[
+                    "uninstall",
+                    "--system",
+                    "--",
+                    "app/org.example.Shared/x86_64/stable"
+                ])
+            )
+        );
+    }
 
     #[test]
     fn auto_selects_yay_on_arch_and_pacman_without_yay() {
@@ -742,6 +1168,7 @@ mod tests {
             !PackageManager {
                 backend: Backend::Pacman,
                 settings_directory: PathBuf::new(),
+                flatpak: None,
             }
             .supports_aur()
         );
@@ -749,6 +1176,7 @@ mod tests {
             !PackageManager {
                 backend: Backend::Dnf,
                 settings_directory: PathBuf::new(),
+                flatpak: None,
             }
             .supports_aur()
         );
@@ -756,6 +1184,7 @@ mod tests {
             PackageManager {
                 backend: Backend::Yay,
                 settings_directory: PathBuf::new(),
+                flatpak: None,
             }
             .supports_aur()
         );
@@ -766,6 +1195,7 @@ mod tests {
         let dnf = PackageManager {
             backend: Backend::Dnf,
             settings_directory: PathBuf::new(),
+            flatpak: None,
         };
         for (source, flag, format) in [
             (
@@ -798,6 +1228,7 @@ mod tests {
             let manager = PackageManager {
                 backend,
                 settings_directory: PathBuf::new(),
+                flatpak: None,
             };
             assert_eq!(
                 manager.query_args(PackageSource::Available),
@@ -816,11 +1247,12 @@ mod tests {
             let manager = PackageManager {
                 backend,
                 settings_directory: PathBuf::new(),
+                flatpak: None,
             };
             let dnf = backend == Backend::Dnf;
             for (action, expected) in [
                 (
-                    Action::Install(strings(&["--unusual", "name with spaces"])),
+                    Action::Install(system_packages(&["--unusual", "name with spaces"])),
                     strings(&[
                         if dnf { "install" } else { "-S" },
                         "--",
@@ -829,11 +1261,11 @@ mod tests {
                     ]),
                 ),
                 (
-                    Action::Remove(strings(&["bash.x86_64"])),
+                    Action::Remove(system_packages(&["bash.x86_64"])),
                     strings(&[if dnf { "remove" } else { "-Rns" }, "--", "bash.x86_64"]),
                 ),
                 (
-                    Action::Install(strings(&["updates/bash.x86_64"])),
+                    Action::Install(system_packages(&["updates/bash.x86_64"])),
                     strings(&[
                         if dnf { "install" } else { "-S" },
                         "--",
@@ -845,7 +1277,7 @@ mod tests {
                     ]),
                 ),
                 (
-                    Action::Remove(strings(&["fedora/bash.x86_64"])),
+                    Action::Remove(system_packages(&["fedora/bash.x86_64"])),
                     strings(&[
                         if dnf { "remove" } else { "-Rns" },
                         "--",

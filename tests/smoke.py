@@ -24,6 +24,22 @@ name = Path(sys.argv[0]).name
 args = sys.argv[1:]
 with open(os.environ["PACK_TEST_LOG"], "a") as log:
     log.write(json.dumps([name, *args]) + "\n")
+if name == os.environ.get("PACK_TEST_FAIL_PROGRAM") and args and args[0] in ["install", "uninstall", "upgrade", "-S", "-Rns"]:
+    print("Simulated transaction failure", file=sys.stderr)
+    sys.exit(1)
+if name == "flatpak" and os.environ.get("PACK_TEST_FAIL_PROGRAM") == "flatpak-query" and args[0] == "remote-ls":
+    print("Remote unavailable", file=sys.stderr)
+    sys.exit(1)
+if name == "flatpak":
+    scope = "user" if "--user" in args else "system"
+    if args[0] in ["remote-ls", "list"]:
+        prefix = "app/" if args[0] == "remote-ls" else ""
+        print(f"flathub\t{prefix}org.example.Shared/x86_64/stable\tShared App")
+        if scope == "user":
+            print(f"testing\t{prefix}org.example.Shared/aarch64/beta\tShared App")
+    elif args[0] in ["remote-info", "info"]:
+        print(f"Name: Shared App\nID: org.example.Shared\nOrigin: flathub\nInstallation: {scope}\nDescription: Flatpak test application")
+    sys.exit(0)
 if name == "id": print("1000")
 elif name == "sudo": sys.exit(subprocess.call(args))
 elif "--info" in args or "-Qi" in args or "-Sii" in args: print("Name : bash\nDescription : Test package")
@@ -51,7 +67,8 @@ elif "-Qq" in args or "-Qtdq" in args or "-Qqm" in args: print("bash\nfzf")
 
 class Session:
     def __init__(self, root, choice, installed, route="install", dnf_version=5,
-                 architecture_blacklist=None, cache_entries=None, cache_age_days=0):
+                 architecture_blacklist=None, cache_entries=None, cache_age_days=0,
+                 flatpak_enabled=False, fail_program="", flatpak_cache_entries=None):
         self.root = root
         self.log = root / "calls.jsonl"
         self.output = b""
@@ -66,6 +83,7 @@ class Session:
         (config / "settings.toml").write_text(
             f'package_manager = "{choice}"\n[appearance]\ntheme = "default"\n'
             f'[fedora]\narchitecture_blacklist = {json.dumps(architecture_blacklist or [])}\n'
+            f'[flatpak]\nenabled = {str(flatpak_enabled).lower()}\n'
         )
         cache = root / "cache" / "pack"
         cache.mkdir(parents=True)
@@ -82,9 +100,11 @@ class Session:
             path.write_text("".join(package + "\n" for package in cache_entries))
             modified = time.time() - cache_age_days * 24 * 60 * 60
             os.utime(path, (modified, modified))
+        if flatpak_cache_entries is not None:
+            (cache / "cache-flatpak-v1").write_text("\n".join(flatpak_cache_entries) + "\n")
         env = dict(os.environ, PATH=str(bindir), TERM="xterm-256color",
                    XDG_CONFIG_DIR=str(root / "config"), XDG_CACHE_HOME=str(root / "cache"),
-                   PACK_TEST_LOG=str(self.log), PACK_TEST_DNF_VERSION=str(dnf_version))
+                   PACK_TEST_LOG=str(self.log), PACK_TEST_DNF_VERSION=str(dnf_version), PACK_TEST_FAIL_PROGRAM=fail_program)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execve(str(BINARY), [str(BINARY), *([route] if route else [])], env)
@@ -226,43 +246,48 @@ def architecture_blacklist_check(root, mode):
         session.close()
 
 
-with tempfile.TemporaryDirectory(prefix="pack-smoke-") as temporary:
-    base = Path(temporary)
-    for index, (choice, installed, expected) in enumerate([
-        ("dnf", ["dnf", "pacman", "yay"], "dnf"),
-        ("pacman", ["dnf", "pacman", "yay"], "pacman"),
-        ("yay", ["pacman", "yay"], "yay"),
-    ]):
-        root = base / str(index)
-        root.mkdir()
-        install_check(root, choice, installed, expected)
-    for index, (route, keys, expected) in enumerate([
-        ("update", b"", ["dnf", "upgrade", "--refresh"]),
-        ("", b"jjj\r\r", ["dnf", "clean", "all"]),
-    ], 3):
-        root = base / str(index)
-        root.mkdir()
-        dnf_action_check(root, route, keys, expected)
+def main():
+    with tempfile.TemporaryDirectory(prefix="pack-smoke-") as temporary:
+        base = Path(temporary)
+        for index, (choice, installed, expected) in enumerate([
+            ("dnf", ["dnf", "pacman", "yay"], "dnf"),
+            ("pacman", ["dnf", "pacman", "yay"], "pacman"),
+            ("yay", ["pacman", "yay"], "yay"),
+        ]):
+            root = base / str(index)
+            root.mkdir()
+            install_check(root, choice, installed, expected)
+        for index, (route, keys, expected) in enumerate([
+            ("update", b"", ["dnf", "upgrade", "--refresh"]),
+            ("", b"jjj\r\r", ["dnf", "clean", "all"]),
+        ], 3):
+            root = base / str(index)
+            root.mkdir()
+            dnf_action_check(root, route, keys, expected)
 
-    for index, (keys, query, first_package) in enumerate([
-        (b"", ["dnf", "--quiet", "repoquery", "--installed"], "bash.x86_64"),
-        (b"j\rjj\r", ["dnf", "--quiet", "repoquery", "--unneeded"], "bash.x86_64"),
-        (b"j\rj\r", ["dnf", "--quiet", "repoquery", "--installed", "--queryformat",
-                       "%{installtime}\t%{from_repo}\t%{name}\t%{arch}\\n"], "fzf.noarch"),
-    ], 5):
-        root = base / str(index)
+        for index, (keys, query, first_package) in enumerate([
+            (b"", ["dnf", "--quiet", "repoquery", "--installed"], "bash.x86_64"),
+            (b"j\rjj\r", ["dnf", "--quiet", "repoquery", "--unneeded"], "bash.x86_64"),
+            (b"j\rj\r", ["dnf", "--quiet", "repoquery", "--installed", "--queryformat",
+                           "%{installtime}\t%{from_repo}\t%{name}\t%{arch}\\n"], "fzf.noarch"),
+        ], 5):
+            root = base / str(index)
+            root.mkdir()
+            dnf_list_check(root, keys, query, first_package)
+
+        root = base / "dnf4"
         root.mkdir()
-        dnf_list_check(root, keys, query, first_package)
+        install_check(root, "dnf", ["dnf"], "dnf", dnf_version=4)
 
-    root = base / "dnf4"
-    root.mkdir()
-    install_check(root, "dnf", ["dnf"], "dnf", dnf_version=4)
-
-    root = base / "dnf4-installed"
-    root.mkdir()
-    dnf_list_check(root, b"", ["dnf", "--quiet", "repoquery", "--installed"], dnf_version=4)
-
-    for mode in ["fresh", "expired", "empty"]:
-        root = base / f"blacklist-{mode}"
+        root = base / "dnf4-installed"
         root.mkdir()
-        architecture_blacklist_check(root, mode)
+        dnf_list_check(root, b"", ["dnf", "--quiet", "repoquery", "--installed"], dnf_version=4)
+
+        for mode in ["fresh", "expired", "empty"]:
+            root = base / f"blacklist-{mode}"
+            root.mkdir()
+            architecture_blacklist_check(root, mode)
+
+
+if __name__ == "__main__":
+    main()

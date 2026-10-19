@@ -3,7 +3,7 @@ name = "pack"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A Ratatui-based Arch Linux and Fedora package manager TUI"
+description = "A Ratatui package manager with Arch Linux, Fedora, and optional Flatpak support"
 license = "GPL-3.0-only"
 
 [dependencies]

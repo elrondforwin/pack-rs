@@ -17,6 +17,7 @@ BuildRequires:  python3 >= 3.11
 Requires:       /usr/bin/dnf
 Requires:       coreutils
 Requires:       sudo
+Suggests:       flatpak
 
 %description
 Pack provides an interactive terminal interface for searching, installing,
@@ -41,6 +42,7 @@ export CARGO_TARGET_DIR="$PWD/target"
 export RUSTFLAGS="%{?build_rustflags}"
 cargo test --release --frozen
 python3 tests/smoke.py target/release/pack
+python3 tests/flatpak_smoke.py target/release/pack
 desktop-file-validate pack.desktop
 
 %files

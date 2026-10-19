@@ -1,6 +1,6 @@
 # Pack
 
-Pack is a lightweight terminal package manager for Arch Linux and Fedora, written in Rust with [Ratatui](https://github.com/ratatui/ratatui).
+Pack is a lightweight terminal package manager for Arch Linux and Fedora with optional Flatpak support, written in Rust with [Ratatui](https://github.com/ratatui/ratatui).
 
 It provides an interactive interface for searching, installing, removing, updating, and inspecting packages through `pacman`, `yay`, or `dnf`.
 
@@ -10,6 +10,7 @@ It provides an interactive interface for searching, installing, removing, updati
 - `sudo` for privileged pacman/DNF operations when running as a regular user
 - Optional on Arch: `yay` for AUR support and `expac` for recently installed packages
 - On Fedora: DNF's built-in `repoquery` command supplies package lists and metadata
+- Optional on any Linux distribution: `flatpak` and configured remotes. When enabled, Pack also works in Flatpak-only mode if no supported native package manager is found.
 
 ## Package manager selection
 
@@ -26,6 +27,10 @@ theme = "default"
 # Fedora/DNF only. Example: ["i686", "aarch64"]
 # Applied when Pack's install-package cache is refreshed, not while browsing.
 architecture_blacklist = []
+
+[flatpak]
+# Optional on every distribution; requires flatpak and configured remotes.
+enabled = false
 ```
 
 `package_manager` accepts `auto`, `pacman`, `yay`, or `dnf`. Existing settings without this key use `auto` and keep their theme. Restart Pack after changing it.
@@ -63,6 +68,44 @@ to the displayed repository.
 Advanced Options contains one **Refresh Pack Cache** action, which uses the selected manager, and **Clear Package Manager Cache** (`pacman/yay -Scc` or `dnf clean all`). There is no separate “without AUR” refresh; select `pacman` for that behavior.
 
 Package lists are cached separately as `cache-pacman`, `cache-yay`, and `cache-dnf-v3`. Switching managers cannot reuse an AUR or another backend's list. The legacy `cache`, `cache-dnf`, and `cache-dnf-v2` files are ignored and may be deleted; earlier DNF caches lack repository metadata or contain concatenated package names. Pack's list cache lasts five days; use Refresh Pack Cache to rebuild it sooner. This is separate from each package manager's own metadata/download cache.
+
+## Optional Flatpak support
+
+Set `[flatpak].enabled = true` in `settings.toml` and restart Pack. The default is
+`false`: Pack does not run Flatpak commands or read its catalog when disabled.
+Enabling it requires the `flatpak` command on `PATH`; Pack does not install Flatpak
+or add remotes automatically.
+
+Flatpak applications appear alongside native packages in **Install Packages** and
+**All Installed Packages**. Rows show the origin remote, application name,
+architecture, and a muted `flatpak:user` or `flatpak:system` label with the branch.
+The user and default system installations are queried separately; named system
+installations are not included. Recent, AUR, and orphan lists remain native-only.
+
+For available applications Pack reads `origin`, `ref`, and `name` from
+`flatpak remote-ls --app`; installed applications use the same columns from
+`flatpak list --app`. Both commands specify `--user` or `--system` and full-width
+columns. Remote names come directly from the `origin` field, not from guessed
+URLs or application names. Full application refs retain the application ID,
+architecture, and branch. Runtimes are managed by Flatpak as dependencies.
+
+Native and Flatpak entries can be selected together. Pack shows the transaction
+plan before Flatpak installs, sends native selections to the chosen native
+manager, and groups Flatpak installs by installation and origin remote. Removals
+use the installation and exact ref. Flatpak runs as the current user, using its
+normal authorization for system installations. If a command fails, Pack reports
+completed commands and stops the remaining ones; changes across managers are not
+atomic.
+
+**Update System** includes Flatpak updates when enabled. **Refresh Pack Cache**
+refreshes both catalogs; Flatpak's catalog has its own five-day `cache-flatpak-v1`
+file. Fedora's architecture blacklist applies only to the native DNF cache.
+An unavailable Flatpak remote does not prevent browsing native packages; Pack
+shows the error or a notice when using a stale Flatpak catalog.
+
+With `package_manager = "auto"`, enabling Flatpak also permits Flatpak-only mode
+on distributions without pacman, yay, or DNF. An explicitly configured native
+manager must still be available.
 
 ## Installation
 
@@ -155,7 +198,7 @@ rm -f ~/.local/share/applications/pack.desktop
 Pack's cache can be removed separately:
 
 ```bash
-rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/pack/"{cache,cache-pacman,cache-yay,cache-dnf,cache-dnf-v2,cache-dnf-v3}
+rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/pack/"{cache,cache-pacman,cache-yay,cache-dnf,cache-dnf-v2,cache-dnf-v3,cache-flatpak-v1}
 ```
 
 ## Development checks
@@ -166,9 +209,14 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
 python3 tests/smoke.py
+python3 tests/flatpak_smoke.py
 ```
 
 The Linux smoke tests use a pseudo-terminal and fake package managers in a temporary directory. They exercise installation, removal, details, cache separation and migration, DNF4/DNF5 query formatting, DNF upgrade/clean, recent packages, and unneeded dependencies without modifying system packages. They require Python 3 at `/usr/bin/python3` and complement, rather than replace, testing on a real Fedora system.
+
+The Flatpak smoke tests additionally cover mixed native/Flatpak selections for
+pacman, yay, and DNF, origin and installation routing, exact refs, partial failures,
+Flatpak-only mode, and the disabled default. All transactions use fake commands.
 
 DNF command behavior follows the [DNF4 command reference](https://dnf.readthedocs.io/en/stable/command_ref.html) and [DNF5 repoquery reference](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html).
 

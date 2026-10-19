@@ -18,12 +18,18 @@ theme = "default"
 # This setting is reread on refresh; no restart is needed.
 # Installed-package lists are not filtered.
 architecture_blacklist = []
+
+[flatpak]
+# Optional on every distribution. Requires flatpak and configured remotes.
+# Includes applications from the user and default system installations.
+enabled = false
 "#;
 
 pub struct Settings {
     pub directory: PathBuf,
     pub theme: String,
     pub package_manager: ManagerChoice,
+    pub flatpak_enabled: bool,
 }
 
 pub(crate) fn load_fedora_architecture_blacklist(directory: &Path) -> io::Result<HashSet<String>> {
@@ -85,6 +91,23 @@ impl Settings {
             .transpose()
             .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?
             .unwrap_or(ManagerChoice::Auto);
+        let flatpak_enabled = match data.get("flatpak") {
+            None => false,
+            Some(flatpak) => {
+                let table = flatpak.as_table().ok_or_else(|| {
+                    io::Error::other(format!("{}: [flatpak] must be a table", path.display()))
+                })?;
+                match table.get("enabled") {
+                    None => false,
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        io::Error::other(format!(
+                            "{}: [flatpak].enabled must be true or false",
+                            path.display()
+                        ))
+                    })?,
+                }
+            }
+        };
         let theme = data
             .get("appearance")
             .and_then(|appearance| appearance.get("theme"))
@@ -108,6 +131,7 @@ impl Settings {
             directory: directory.to_owned(),
             theme: theme.to_owned(),
             package_manager,
+            flatpak_enabled,
         })
     }
 }
@@ -133,6 +157,24 @@ pub(crate) fn write_if_missing(path: PathBuf, content: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatpak_is_opt_in_and_requires_a_boolean() {
+        let root =
+            env::temp_dir().join(format!("pack-flatpak-settings-test-{}", std::process::id()));
+        assert!(!Settings::load_from(&root).unwrap().flatpak_enabled);
+        let path = root.join("settings.toml");
+        let appearance = "[appearance]\ntheme = \"default\"\n";
+        fs::write(&path, appearance).unwrap();
+        assert!(!Settings::load_from(&root).unwrap().flatpak_enabled);
+        fs::write(&path, format!("{appearance}[flatpak]\nenabled = true\n")).unwrap();
+        assert!(Settings::load_from(&root).unwrap().flatpak_enabled);
+        for value in ["\"true\"", "42", "[]"] {
+            fs::write(&path, format!("{appearance}[flatpak]\nenabled = {value}\n")).unwrap();
+            assert!(Settings::load_from(&root).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fedora_blacklist_defaults_validates_and_rereads_changes() {

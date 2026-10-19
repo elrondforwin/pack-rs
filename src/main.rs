@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod flatpak;
 mod package;
 mod theme;
 
@@ -28,7 +29,7 @@ use ratatui::{
 };
 
 use cache::PackageCache;
-use package::{Action, Backend, PackageList, PackageManager, PackageSource};
+use package::{Action, Backend, Package, PackageList, PackageManager, PackageSource};
 use theme::Theme;
 
 const MAIN_MENU: [&str; 5] = [
@@ -52,6 +53,22 @@ const REMOVE_MENU_WITHOUT_AUR: [&str; 4] = [
     "Back",
 ];
 const ADVANCED_MENU: [&str; 3] = ["Clear Package Manager Cache", "Refresh Pack Cache", "Back"];
+
+fn advanced_menu(native: bool) -> &'static [&'static str] {
+    if native {
+        &ADVANCED_MENU
+    } else {
+        &["Refresh Pack Cache", "Back"]
+    }
+}
+
+fn visible_remove_menu(aur: bool, native: bool) -> &'static [&'static str] {
+    if native {
+        remove_menu(aur)
+    } else {
+        &["All Installed Packages", "Back"]
+    }
+}
 
 fn remove_menu(aur: bool) -> &'static [&'static str] {
     if aur {
@@ -78,8 +95,12 @@ fn main() -> io::Result<()> {
 
     let settings = config::Settings::load()?;
     let theme = Theme::load(&settings)?;
-    let manager = PackageManager::new(settings.package_manager, settings.directory)
-        .map_err(io::Error::other)?;
+    let manager = PackageManager::new(
+        settings.package_manager,
+        settings.directory,
+        settings.flatpak_enabled,
+    )
+    .map_err(io::Error::other)?;
     let cache = PackageCache::from_environment(manager.backend())?;
     let mut terminal = TerminalSession::start()?;
     run(&mut terminal, &manager, &cache, &theme, route)
@@ -93,6 +114,7 @@ fn run(
     route: Route,
 ) -> io::Result<()> {
     let mut app = App::new(manager.supports_aur());
+    app.native_backend = manager.backend() != Backend::Flatpak;
     match route {
         Route::Tui => {}
         Route::Install => process_request(
@@ -156,7 +178,9 @@ fn process_request(
     request: Request,
 ) {
     match request {
-        Request::Load(source) if source == PackageSource::Available && cache.is_fresh() => {
+        Request::Load(source)
+            if source == PackageSource::Available && manager.cache_is_fresh(cache) =>
+        {
             match manager.list(cache, source) {
                 Ok(list) => {
                     if let Some(request) = app.show_packages(source, list) {
@@ -197,8 +221,15 @@ fn render(frame: &mut Frame, app: &mut App, manager: &PackageManager, theme: &Th
     let cursor = app.cursor;
     match &mut app.screen {
         Screen::Main => render_menu(frame, &MAIN_MENU, cursor, theme),
-        Screen::RemoveMenu => render_menu(frame, remove_menu(app.aur_enabled), cursor, theme),
-        Screen::AdvancedMenu => render_menu(frame, &ADVANCED_MENU, cursor, theme),
+        Screen::RemoveMenu => render_menu(
+            frame,
+            visible_remove_menu(app.aur_enabled, app.native_backend),
+            cursor,
+            theme,
+        ),
+        Screen::AdvancedMenu => {
+            render_menu(frame, advanced_menu(app.native_backend), cursor, theme)
+        }
         Screen::Packages(view) => render_packages(frame, view, cursor, manager.backend(), theme),
         Screen::Confirm(action) => render_confirmation(frame, action, manager),
         Screen::Output(output) => render_output(frame, output),
@@ -279,7 +310,7 @@ fn render_packages(
             .and_then(|index| view.packages.get(*index));
         let details = match current {
             None => "No matching package.",
-            Some(package) if view.details_package.as_deref() == Some(package.as_str()) => view
+            Some(package) if view.details_package.as_ref() == Some(package) => view
                 .details
                 .as_deref()
                 .unwrap_or("Loading package details..."),
@@ -368,7 +399,24 @@ fn render_package_results(
             ),
             marker_style,
         )];
-        spans.extend(package_label(package, backend, style, theme).spans);
+        match package {
+            Package::System(name) => spans.extend(package_label(name, backend, style, theme).spans),
+            Package::Flatpak(app) => {
+                let muted = Style::default().fg(theme.muted);
+                spans.push(Span::styled(app.remote.as_str(), muted));
+                spans.push(Span::styled(" › ", Style::default().fg(theme.separator)));
+                spans.push(Span::styled(app.name.as_str(), style));
+                spans.push(Span::styled(
+                    format!(
+                        " {} [flatpak:{} {}]",
+                        app.arch(),
+                        app.scope.name(),
+                        app.branch()
+                    ),
+                    muted,
+                ));
+            }
+        }
         let line = Line::from(spans);
         let y = area.y + area.height - 1 - row as u16;
         frame.render_widget(
@@ -400,7 +448,7 @@ fn package_label<'a>(package: &'a str, backend: Backend, style: Style, theme: &T
 }
 
 fn format_details(details: &str, theme: &Theme) -> Text<'static> {
-    const BASIC_FIELDS: [&str; 12] = [
+    const BASIC_FIELDS: &[&str] = &[
         "Repository",
         "Name",
         "Version",
@@ -413,6 +461,12 @@ fn format_details(details: &str, theme: &Theme) -> Text<'static> {
         "Packager",
         "Build Date",
         "Install Date",
+        "ID",
+        "Ref",
+        "Branch",
+        "Origin",
+        "Installation",
+        "Runtime",
     ];
     let key_style = Style::default()
         .fg(theme.muted)
@@ -477,6 +531,7 @@ struct App {
     remove_cursor: usize,
     advanced_cursor: usize,
     aur_enabled: bool,
+    native_backend: bool,
     loading: Option<LoadingTask>,
     details_loading: Option<DetailsTask>,
     details_debounce: Option<Instant>,
@@ -492,6 +547,7 @@ impl App {
             remove_cursor: 0,
             advanced_cursor: 0,
             aur_enabled,
+            native_backend: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -523,11 +579,20 @@ impl App {
             Screen::RemoveMenu => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Esc => next_screen = Some(Screen::Main),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    previous(&mut self.cursor, remove_menu(self.aur_enabled).len())
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    next(&mut self.cursor, remove_menu(self.aur_enabled).len())
+                KeyCode::Up | KeyCode::Char('k') => previous(
+                    &mut self.cursor,
+                    visible_remove_menu(self.aur_enabled, self.native_backend).len(),
+                ),
+                KeyCode::Down | KeyCode::Char('j') => next(
+                    &mut self.cursor,
+                    visible_remove_menu(self.aur_enabled, self.native_backend).len(),
+                ),
+                KeyCode::Enter if !self.native_backend => {
+                    if self.cursor == 0 {
+                        request = Some(Request::Load(PackageSource::Installed));
+                    } else {
+                        next_screen = Some(Screen::Main);
+                    }
                 }
                 KeyCode::Enter => match self.cursor {
                     0 => request = Some(Request::Load(PackageSource::Installed)),
@@ -542,8 +607,19 @@ impl App {
             Screen::AdvancedMenu => match key.code {
                 KeyCode::Char('q') => self.should_quit = true,
                 KeyCode::Esc => next_screen = Some(Screen::Main),
-                KeyCode::Up | KeyCode::Char('k') => previous(&mut self.cursor, ADVANCED_MENU.len()),
-                KeyCode::Down | KeyCode::Char('j') => next(&mut self.cursor, ADVANCED_MENU.len()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    previous(&mut self.cursor, advanced_menu(self.native_backend).len())
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    next(&mut self.cursor, advanced_menu(self.native_backend).len())
+                }
+                KeyCode::Enter if !self.native_backend => {
+                    if self.cursor == 0 {
+                        next_screen = Some(Screen::Confirm(Action::RefreshCache));
+                    } else {
+                        next_screen = Some(Screen::Main);
+                    }
+                }
                 KeyCode::Enter => match self.cursor {
                     0 => next_screen = Some(Screen::Confirm(Action::ClearPackageCache)),
                     1 => next_screen = Some(Screen::Confirm(Action::RefreshCache)),
@@ -712,7 +788,9 @@ impl App {
                         } else {
                             Action::Install(packages)
                         };
-                        if view.source.is_installed() {
+                        if view.source.is_installed()
+                            || matches!(&action, Action::Install(packages) if packages.iter().any(|package| matches!(package, Package::Flatpak(_))))
+                        {
                             next_screen = Some(Screen::Confirm(action));
                         } else {
                             request = Some(Request::Execute(action));
@@ -830,7 +908,7 @@ impl App {
     fn start_details_loading(
         &mut self,
         manager: &PackageManager,
-        package: String,
+        package: Package,
         installed: bool,
     ) {
         if self
@@ -883,7 +961,7 @@ impl App {
         }
     }
 
-    fn poll_details(&mut self) -> Option<(String, String)> {
+    fn poll_details(&mut self) -> Option<(Package, String)> {
         let task = self.details_loading.as_ref()?;
         match task.receiver.try_recv() {
             Ok(result) => {
@@ -922,7 +1000,7 @@ impl App {
         let packages = list.packages;
         let folded_packages = packages
             .iter()
-            .map(|package| package.to_lowercase())
+            .map(|package| package.search_text().to_lowercase())
             .collect::<Vec<_>>();
         let matches = fuzzy_matches_prepared("", &packages, &folded_packages);
         let back = match source {
@@ -965,10 +1043,10 @@ impl App {
         }));
     }
 
-    fn set_package_details(&mut self, package: String, details: String) {
+    fn set_package_details(&mut self, package: Package, details: String) {
         if let Screen::Packages(view) = &mut self.screen
             && view.details_visible
-            && view.details_package.as_deref() == Some(package.as_str())
+            && view.details_package.as_ref() == Some(&package)
             && view
                 .matches
                 .get(self.cursor)
@@ -995,14 +1073,14 @@ struct LoadingTask {
 }
 
 struct DetailsTask {
-    package: String,
+    package: Package,
     installed: bool,
-    receiver: Receiver<(String, String)>,
+    receiver: Receiver<(Package, String)>,
 }
 
 struct PackageView {
     source: PackageSource,
-    packages: Vec<String>,
+    packages: Vec<Package>,
     folded_packages: Vec<String>,
     matches: Vec<usize>,
     back: PackageBack,
@@ -1013,7 +1091,7 @@ struct PackageView {
     loading: bool,
     details_visible: bool,
     details: Option<String>,
-    details_package: Option<String>,
+    details_package: Option<Package>,
     details_scroll: u16,
     scroll_offset: usize,
     viewport_height: usize,
@@ -1144,7 +1222,7 @@ struct OutputView {
 
 enum Request {
     Load(PackageSource),
-    Details { package: String, installed: bool },
+    Details { package: Package, installed: bool },
     Execute(Action),
 }
 
@@ -1183,7 +1261,7 @@ fn usage() -> &'static str {
     "Usage: pack [install|remove|uninstall|update]\n\nLaunches the interactive interface when no command is provided."
 }
 
-fn selected_packages(view: &PackageView) -> Vec<String> {
+fn selected_packages(view: &PackageView) -> Vec<Package> {
     view.packages
         .iter()
         .zip(&view.selected)
@@ -1201,7 +1279,11 @@ fn fuzzy_matches(query: &str, packages: &[String]) -> Vec<usize> {
     fuzzy_matches_prepared(query, packages, &folded)
 }
 
-fn fuzzy_matches_prepared(query: &str, packages: &[String], folded: &[String]) -> Vec<usize> {
+fn fuzzy_matches_prepared(
+    query: &str,
+    packages: &[impl AsRef<str>],
+    folded: &[String],
+) -> Vec<usize> {
     let query = query
         .to_lowercase()
         .chars()
@@ -1213,14 +1295,14 @@ fn fuzzy_matches_prepared(query: &str, packages: &[String], folded: &[String]) -
             packages
                 .iter()
                 .enumerate()
-                .filter(|(_, package)| !is_aur_package(package))
+                .filter(|(_, package)| !is_aur_package(package.as_ref()))
                 .map(|(index, _)| index),
         );
         matches.extend(
             packages
                 .iter()
                 .enumerate()
-                .filter(|(_, package)| is_aur_package(package))
+                .filter(|(_, package)| is_aur_package(package.as_ref()))
                 .map(|(index, _)| index),
         );
         return matches;
@@ -1234,8 +1316,8 @@ fn fuzzy_matches_prepared(query: &str, packages: &[String], folded: &[String]) -
                 (
                     index,
                     score,
-                    is_exact_package_name(&query, &packages[index]),
-                    is_aur_package(&packages[index]),
+                    is_exact_package_name(&query, packages[index].as_ref()),
+                    is_aur_package(packages[index].as_ref()),
                 )
             })
         })
@@ -1555,7 +1637,7 @@ mod tests {
     fn selected_packages_only_returns_checked_entries() {
         let view = PackageView {
             source: PackageSource::Available,
-            packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+            packages: vec!["core/bash".to_owned().into(), "extra/fzf".to_owned().into()],
             folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
             matches: vec![0, 1],
             back: PackageBack::Main,
@@ -1571,7 +1653,10 @@ mod tests {
             scroll_offset: 0,
             viewport_height: 1,
         };
-        assert_eq!(selected_packages(&view), vec!["core/bash"]);
+        assert_eq!(
+            selected_packages(&view),
+            vec![Package::System("core/bash".to_owned())]
+        );
     }
 
     #[test]
@@ -1582,12 +1667,13 @@ mod tests {
             remove_cursor: 1,
             advanced_cursor: 0,
             aur_enabled: false,
+            native_backend: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Installed,
-                packages: vec!["extra/fzf".to_owned()],
+                packages: vec!["extra/fzf".to_owned().into()],
                 folded_packages: vec!["extra/fzf".to_owned()],
                 matches: vec![0],
                 back: PackageBack::RemoveMenu,
@@ -1693,12 +1779,13 @@ mod tests {
             remove_cursor: 0,
             advanced_cursor: 0,
             aur_enabled: false,
+            native_backend: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
-                packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+                packages: vec!["core/bash".to_owned().into(), "extra/fzf".to_owned().into()],
                 folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
                 matches: vec![0, 1],
                 back: PackageBack::Main,
@@ -1709,7 +1796,7 @@ mod tests {
                 loading: false,
                 details_visible: true,
                 details: Some("Name: bash".to_owned()),
-                details_package: Some("core/bash".to_owned()),
+                details_package: Some("core/bash".to_owned().into()),
                 details_scroll: 0,
                 scroll_offset: 0,
                 viewport_height: 1,
@@ -1719,7 +1806,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
-        app.set_package_details("core/bash".to_owned(), "Name: bash".to_owned());
+        app.set_package_details("core/bash".to_owned().into(), "Name: bash".to_owned());
 
         let Screen::Packages(view) = app.screen else {
             panic!("package screen should be preserved");
@@ -1727,7 +1814,10 @@ mod tests {
         assert_eq!(view.query, "fz");
         assert_eq!(view.matches, vec![1]);
         assert!(view.details.is_none());
-        assert_eq!(selected_packages(&view), vec!["core/bash"]);
+        assert_eq!(
+            selected_packages(&view),
+            vec![Package::System("core/bash".to_owned())]
+        );
     }
 
     #[test]
@@ -1738,12 +1828,13 @@ mod tests {
             remove_cursor: 0,
             advanced_cursor: 0,
             aur_enabled: false,
+            native_backend: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
             screen: Screen::Packages(PackageView {
                 source: PackageSource::Available,
-                packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
+                packages: vec!["core/bash".to_owned().into(), "extra/fzf".to_owned().into()],
                 folded_packages: vec!["core/bash".to_owned(), "extra/fzf".to_owned()],
                 matches: vec![0, 1],
                 back: PackageBack::Main,

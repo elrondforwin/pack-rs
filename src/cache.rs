@@ -26,6 +26,7 @@ impl PackageCache {
             Backend::Yay => "cache-yay",
             // Earlier formats lack repository metadata (or contain concatenated DNF5 records).
             Backend::Dnf => "cache-dnf-v3",
+            Backend::Flatpak => "cache-flatpak-v1",
         };
         Ok(Self {
             path: base.join("pack").join(filename),

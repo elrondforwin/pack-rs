@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Pack
-Comment=Arch Linux and Fedora package manager
+Comment=Terminal package manager
 Exec=pack
 Icon=package
 Terminal=true
 Categories=Settings;PackageManager;
-Keywords=arch;fedora;aur;pacman;yay;dnf;package;
+Keywords=arch;fedora;aur;pacman;yay;dnf;flatpak;package;

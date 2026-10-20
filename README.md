@@ -9,10 +9,9 @@ It provides an interactive interface for searching, installing, removing, updati
 - Arch Linux with `pacman`, or Fedora with `dnf` (DNF4 or DNF5)
 - `sudo` for privileged pacman/DNF operations when running as a regular user
 - Optional on Arch: `yay` for AUR support and `expac` for recently installed packages
-- On Fedora: DNF's built-in `repoquery` command supplies package lists and metadata
-- Optional on any Linux distribution: `flatpak` and configured remotes. When enabled, Pack also works in Flatpak-only mode if no supported native package manager is found.
+- Optional on any Linux distribution: `flatpak` and configured remotes.
 
-## Package manager selection
+## Configuration
 
 Pack creates `settings.toml` in `${XDG_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}/pack/` on first launch:
 
@@ -34,83 +33,49 @@ architecture_blacklist = []
 enabled = false
 ```
 
-`package_manager` accepts `auto`, `pacman`, `yay`, or `dnf`. Existing settings without this key use `auto` and keep their theme. Restart Pack after changing it.
+Choose `auto`, `pacman`, `yay`, or `dnf` for `package_manager`:
 
-- `auto`: on Arch, choose `yay` if it is executable on `PATH`, otherwise `pacman`. On Fedora and Fedora/RHEL derivatives, prefer `dnf`. When the native choice is unavailable or the distribution is unknown, fall back to available commands in `yay`, `pacman`, `dnf` order (DNF first on Fedora/RHEL).
-- `pacman`: use only official/configured pacman repositories, even if yay is installed. AUR packages are excluded from Pack's install cache and the AUR menu is hidden.
-- `yay`: enable AUR operations. Requires `yay` on `PATH`.
-- `dnf`: use enabled DNF repositories. Requires `dnf` on `PATH`.
+- `auto`: prefer yay/pacman on Arch and DNF on Fedora; otherwise use an available supported manager.
+- `pacman`: use configured pacman repositories without AUR.
+- `yay`: include AUR support.
+- `dnf`: use enabled DNF repositories.
 
-An explicitly selected manager that is missing produces an error; Pack does not silently switch managers.
+An explicitly selected manager must be installed. Restart Pack after changing the
+manager, theme, details visibility, or Flatpak setting.
 
-Set `[appearance].details_visible = false` to open package lists with details hidden.
-Ctrl+P still toggles the details panel. Missing settings default to `true`; restart
-Pack after changing this option.
+Set `[appearance].details_visible = false` to open package lists with details
+hidden. Ctrl+P toggles the panel; the default is `true`.
 
-Fedora's `architecture_blacklist` excludes exact architecture names when building
-the install-package cache. For example, `architecture_blacklist = ["i686", "aarch64"]`
-prevents those packages from being cached; the default empty list allows all
-architectures. This setting is ignored by pacman/yay and does not hide installed,
-recent, or unneeded packages. Existing settings without the key allow all
-architectures and are left unchanged.
+Fedora's `architecture_blacklist` excludes exact architectures from the
+install-package cache. For example, `["i686", "aarch64"]` excludes those
+architectures; an empty list allows all. Installed-package lists are unaffected.
+Changes take effect on the next cache refresh without restarting Pack.
 
-Changing the blacklist does not invalidate or filter an existing cache. It takes
-effect on the next automatic refresh after the five-day TTL or through
-**Advanced Options → Refresh Pack Cache**. The configuration is reread only when
-rebuilding the DNF cache, so manual refresh applies edits without restarting Pack.
-
-Fedora supports package installation/removal, system upgrades, available and installed lists, package details, the 200 most recently installed packages, unneeded dependencies, and package manager cache cleaning. DNF lists show `repository › name architecture`, with the repository and architecture in the same muted theme color. AUR is exclusive to yay; it has no Fedora equivalent. DNF removal follows DNF's dependency/configuration handling, rather than reproducing pacman's `-Rns` semantics.
-
-Repository metadata is fetched in the same bulk `dnf repoquery` call as package
-names and architectures. Available packages use `%{repoid}`; installed, recent,
-and unneeded packages use `%{from_repo}` (the recorded installation origin).
-When DNF has no origin recorded, Pack shows `@System`. Recent packages also
-request `%{installtime}` and are sorted newest first. Records use tab-separated
-fields and an explicit newline so DNF4 and DNF5 both parse correctly. Package
-operations keep the `name.arch` identifier; available-package details are scoped
-to the displayed repository.
-
-Advanced Options contains one **Refresh Pack Cache** action, which uses the selected manager, and **Clear Package Manager Cache** (`pacman/yay -Scc` or `dnf clean all`). There is no separate “without AUR” refresh; select `pacman` for that behavior.
-
-Package lists are cached separately as `cache-pacman`, `cache-yay`, and `cache-dnf-v3`. Switching managers cannot reuse an AUR or another backend's list. The legacy `cache`, `cache-dnf`, and `cache-dnf-v2` files are ignored and may be deleted; earlier DNF caches lack repository metadata or contain concatenated package names. Pack's list cache lasts five days; use Refresh Pack Cache to rebuild it sooner. This is separate from each package manager's own metadata/download cache.
+Package lists are cached separately for each backend for five days. Use
+**Advanced Options → Refresh Pack Cache** to rebuild them sooner.
+**Clear Package Manager Cache** clears the native manager's own cache.
 
 ## Optional Flatpak support
 
-Set `[flatpak].enabled = true` in `settings.toml` and restart Pack. The default is
-`false`: Pack does not run Flatpak commands or read its catalog when disabled.
-Enabling it requires the `flatpak` command on `PATH`; Pack does not install Flatpak
-or add remotes automatically.
+Set `[flatpak].enabled = true` and restart Pack. Flatpak is disabled by default;
+Pack does not install it or add remotes automatically.
 
-Flatpak applications appear alongside native packages in **Install Packages** and
-**All Installed Packages**. Rows show the origin remote, application name,
-architecture, and a muted `flatpak:user` or `flatpak:system` label with the branch.
-The user and default system installations are queried separately; named system
-installations are not included. Recent, AUR, and orphan lists remain native-only.
+Applications appear alongside native packages in **Install Packages** and
+**All Installed Packages**, showing the remote, name, architecture, branch, and
+`flatpak:user` or `flatpak:system` scope. User and default system installations
+are supported; named system installations are excluded. Recent, AUR, and orphan
+lists contain native packages only.
 
-For available applications Pack reads `origin`, `ref`, and `name` from
-`flatpak remote-ls --app`; installed applications use the same columns from
-`flatpak list --app`. Both commands specify `--user` or `--system` and full-width
-columns. Remote names come directly from the `origin` field, not from guessed
-URLs or application names. Full application refs retain the application ID,
-architecture, and branch. Runtimes are managed by Flatpak as dependencies.
+You can select native and Flatpak packages together. Pack shows a plan before
+Flatpak installs and sends each selection to its package manager. If a command
+fails, completed operations remain applied and the remaining commands stop.
 
-Native and Flatpak entries can be selected together. Pack shows the transaction
-plan before Flatpak installs, sends native selections to the chosen native
-manager, and groups Flatpak installs by installation and origin remote. Removals
-use the installation and exact ref. Flatpak runs as the current user, using its
-normal authorization for system installations. If a command fails, Pack reports
-completed commands and stops the remaining ones; changes across managers are not
-atomic.
+**Update System** includes Flatpak updates, and **Refresh Pack Cache** refreshes
+both catalogs. An unavailable Flatpak remote does not prevent browsing native
+packages; Pack displays a notice if it uses a stale Flatpak catalog.
 
-**Update System** includes Flatpak updates when enabled. **Refresh Pack Cache**
-refreshes both catalogs; Flatpak's catalog has its own five-day `cache-flatpak-v1`
-file. Fedora's architecture blacklist applies only to the native DNF cache.
-An unavailable Flatpak remote does not prevent browsing native packages; Pack
-shows the error or a notice when using a stale Flatpak catalog.
-
-With `package_manager = "auto"`, enabling Flatpak also permits Flatpak-only mode
-on distributions without pacman, yay, or DNF. An explicitly configured native
-manager must still be available.
+With `package_manager = "auto"`, Flatpak-only mode is available on distributions
+without pacman, yay, or DNF.
 
 ## Installation
 
@@ -125,20 +90,16 @@ cd pack-rs
 cargo install --path . --locked
 ```
 
-Cargo builds the release binary and installs `pack` in `~/.cargo/bin` by default
-(or `$CARGO_HOME/bin` when set, unless a Cargo installation-root override is
-configured). No `sudo` is needed. Add the Cargo bin directory to your shell's
-`PATH` if necessary:
+Cargo installs `pack` in `~/.cargo/bin` by default (`$CARGO_HOME/bin` when set).
+No `sudo` is needed. Add that directory to your shell's `PATH` if necessary:
 
 ```bash
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 pack
 ```
 
-Persist that `export` in your shell configuration, such as `~/.zshrc` or
-`~/.bashrc`. If an RPM or manually installed copy also exists, `command -v pack`
-shows which binary your shell will launch; put Cargo's bin directory first to
-use the Cargo version.
+Persist the `export` in `~/.zshrc` or `~/.bashrc`. If multiple copies are installed,
+`command -v pack` shows which one your shell launches.
 
 To update, run these commands from the checkout:
 
@@ -147,13 +108,8 @@ git pull --ff-only
 cargo install --path . --locked
 ```
 
-The same install command also rebuilds local edits without changing the version.
-Cargo installs the binary only: install the native package manager, optional
-Flatpak, and other runtime requirements separately. Pack creates its user
-configuration on first launch; Cargo does not install a desktop launcher.
-RPM and Arch packages below provide desktop integration and package-manager
-tracking instead. See the [Cargo installation reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
-for installation-root overrides.
+Cargo installs the binary only. Install runtime requirements separately; use the
+Arch or RPM package below if you also want a desktop launcher.
 
 ### Arch package
 
@@ -175,30 +131,16 @@ python3 packaging/fedora/build.py
 sudo dnf install ./target/rpm/pack.rpm
 ```
 
-The locked dependencies currently require Rust 1.88 or newer and the build helper
-requires Python 3.11 or newer. Run the build as your regular user. The helper
-packages the current checkout, including local source edits, and prepares vendored
-dependencies with `cargo vendor --locked`. This preparation may use the internet;
-the RPM compilation and tests run offline with `--frozen`.
+The RPM helper requires Python 3.11 or newer and the same Rust version as the
+Cargo installation. Run it as your regular user. The RPM installs the binary and
+desktop launcher; DNF resolves runtime dependencies.
 
-The resulting RPM installs `pack` in `/usr/bin`, its desktop entry, and license
-notices. DNF resolves its runtime dependencies. Build files stay in `target/rpm/`;
-no COPR account or additional repository is required. To rebuild after updating
-the checkout, rerun the last two commands.
-If the same package version is already installed, use
-`sudo dnf reinstall ./target/rpm/pack.rpm` to install the rebuilt binary.
-
-Distribution recipes live in `packaging/arch/` and `packaging/fedora/`.
-
-### Manual binary installation
+To rebuild after updating the checkout, rerun the build and install commands.
+If the same version is already installed, use:
 
 ```bash
-cargo build --release --locked
-install -Dm755 target/release/pack ~/.local/bin/pack
-install -Dm644 pack.desktop ~/.local/share/applications/pack.desktop
+sudo dnf reinstall ./target/rpm/pack.rpm
 ```
-
-Make sure `~/.local/bin` is in your `PATH`.
 
 ## Usage
 
@@ -210,8 +152,9 @@ pack
 
 ## Themes
 
-On first launch, Pack creates `settings.toml` and `themes/default.toml` in `${XDG_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}/pack/`.
-To add a theme, copy `themes/default.toml` to `themes/mytheme.toml`, edit its colors, and select it in `settings.toml`:
+In the configuration directory above, Pack creates `themes/default.toml` on first
+launch. Copy it to `themes/mytheme.toml`, edit its colors, and select it in
+`settings.toml`:
 
 ```toml
 [appearance]
@@ -242,18 +185,8 @@ If installed as a Fedora RPM:
 sudo dnf remove pack
 ```
 
-If installed manually:
-
-```bash
-rm -f ~/.local/bin/pack
-rm -f ~/.local/share/applications/pack.desktop
-```
-
-Pack's cache can be removed separately:
-
-```bash
-rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/pack/"{cache,cache-pacman,cache-yay,cache-dnf,cache-dnf-v2,cache-dnf-v3,cache-flatpak-v1}
-```
+Configuration and cache are kept when uninstalling. Pack's cache directory is
+`${XDG_CACHE_HOME:-$HOME/.cache}/pack/`.
 
 ## Development checks
 
@@ -266,13 +199,8 @@ python3 tests/smoke.py
 python3 tests/flatpak_smoke.py
 ```
 
-The Linux smoke tests use a pseudo-terminal and fake package managers in a temporary directory. They exercise installation, removal, details, cache separation and migration, DNF4/DNF5 query formatting, DNF upgrade/clean, recent packages, and unneeded dependencies without modifying system packages. They require Python 3 at `/usr/bin/python3` and complement, rather than replace, testing on a real Fedora system.
-
-The Flatpak smoke tests additionally cover mixed native/Flatpak selections for
-pacman, yay, and DNF, origin and installation routing, exact refs, partial failures,
-Flatpak-only mode, and the disabled default. All transactions use fake commands.
-
-DNF command behavior follows the [DNF4 command reference](https://dnf.readthedocs.io/en/stable/command_ref.html) and [DNF5 repoquery reference](https://dnf5.readthedocs.io/en/latest/commands/repoquery.8.html).
+The smoke tests require Python 3 at `/usr/bin/python3`. They use fake package
+managers and do not modify system packages.
 
 ## Credits
 

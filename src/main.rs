@@ -103,7 +103,14 @@ fn main() -> io::Result<()> {
     .map_err(io::Error::other)?;
     let cache = PackageCache::from_environment(manager.backend())?;
     let mut terminal = TerminalSession::start()?;
-    run(&mut terminal, &manager, &cache, &theme, route)
+    run(
+        &mut terminal,
+        &manager,
+        &cache,
+        &theme,
+        route,
+        settings.details_visible,
+    )
 }
 
 fn run(
@@ -112,9 +119,11 @@ fn run(
     cache: &PackageCache,
     theme: &Theme,
     route: Route,
+    details_visible: bool,
 ) -> io::Result<()> {
     let mut app = App::new(manager.supports_aur());
     app.native_backend = manager.backend() != Backend::Flatpak;
+    app.details_visible_by_default = details_visible;
     match route {
         Route::Tui => {}
         Route::Install => process_request(
@@ -532,6 +541,7 @@ struct App {
     advanced_cursor: usize,
     aur_enabled: bool,
     native_backend: bool,
+    details_visible_by_default: bool,
     loading: Option<LoadingTask>,
     details_loading: Option<DetailsTask>,
     details_debounce: Option<Instant>,
@@ -548,6 +558,7 @@ impl App {
             advanced_cursor: 0,
             aur_enabled,
             native_backend: true,
+            details_visible_by_default: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -896,7 +907,7 @@ impl App {
             query: String::new(),
             query_cursor: 0,
             loading: true,
-            details_visible: true,
+            details_visible: self.details_visible_by_default,
             details: None,
             details_package: None,
             details_scroll: 0,
@@ -1021,7 +1032,7 @@ impl App {
             query: String::new(),
             query_cursor: 0,
             loading: false,
-            details_visible: true,
+            details_visible: self.details_visible_by_default,
             details: None,
             details_package: None,
             details_scroll: 0,
@@ -1668,6 +1679,7 @@ mod tests {
             advanced_cursor: 0,
             aur_enabled: false,
             native_backend: true,
+            details_visible_by_default: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -1780,6 +1792,7 @@ mod tests {
             advanced_cursor: 0,
             aur_enabled: false,
             native_backend: true,
+            details_visible_by_default: true,
             loading: None,
             details_loading: None,
             details_debounce: None,
@@ -1829,6 +1842,7 @@ mod tests {
             advanced_cursor: 0,
             aur_enabled: false,
             native_backend: true,
+            details_visible_by_default: true,
             loading: None,
             details_loading: None,
             details_debounce: None,

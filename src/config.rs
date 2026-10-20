@@ -10,6 +10,8 @@ const DEFAULT_SETTINGS: &str = r#"package_manager = "auto"
 
 [appearance]
 theme = "default"
+# Show package details initially; Ctrl+P toggles them while browsing.
+details_visible = true
 
 [fedora]
 # Fedora/DNF only: exclude these architectures from the install-package cache.
@@ -30,6 +32,7 @@ pub struct Settings {
     pub theme: String,
     pub package_manager: ManagerChoice,
     pub flatpak_enabled: bool,
+    pub details_visible: bool,
 }
 
 pub(crate) fn load_fedora_architecture_blacklist(directory: &Path) -> io::Result<HashSet<String>> {
@@ -108,6 +111,19 @@ impl Settings {
                 }
             }
         };
+        let details_visible = data
+            .get("appearance")
+            .and_then(|appearance| appearance.get("details_visible"))
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{}: [appearance].details_visible must be true or false",
+                        path.display()
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(true);
         let theme = data
             .get("appearance")
             .and_then(|appearance| appearance.get("theme"))
@@ -132,6 +148,7 @@ impl Settings {
             theme: theme.to_owned(),
             package_manager,
             flatpak_enabled,
+            details_visible,
         })
     }
 }

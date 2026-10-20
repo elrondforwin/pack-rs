@@ -22,6 +22,7 @@ package_manager = "auto"
 
 [appearance]
 theme = "default"
+details_visible = true
 
 [fedora]
 # Fedora/DNF only. Example: ["i686", "aarch64"]
@@ -41,6 +42,10 @@ enabled = false
 - `dnf`: use enabled DNF repositories. Requires `dnf` on `PATH`.
 
 An explicitly selected manager that is missing produces an error; Pack does not silently switch managers.
+
+Set `[appearance].details_visible = false` to open package lists with details hidden.
+Ctrl+P still toggles the details panel. Missing settings default to `true`; restart
+Pack after changing this option.
 
 Fedora's `architecture_blacklist` excludes exact architecture names when building
 the install-package cache. For example, `architecture_blacklist = ["i686", "aarch64"]`
@@ -109,6 +114,47 @@ manager must still be available.
 
 ## Installation
 
+### Cargo (common installation method)
+
+On any supported Linux distribution, install from the checkout as your regular
+user. Requires Rust 1.88 or newer, Cargo, and a C compiler/linker:
+
+```bash
+git clone https://github.com/elrondforwin/pack-rs.git
+cd pack-rs
+cargo install --path . --locked
+```
+
+Cargo builds the release binary and installs `pack` in `~/.cargo/bin` by default
+(or `$CARGO_HOME/bin` when set, unless a Cargo installation-root override is
+configured). No `sudo` is needed. Add the Cargo bin directory to your shell's
+`PATH` if necessary:
+
+```bash
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+pack
+```
+
+Persist that `export` in your shell configuration, such as `~/.zshrc` or
+`~/.bashrc`. If an RPM or manually installed copy also exists, `command -v pack`
+shows which binary your shell will launch; put Cargo's bin directory first to
+use the Cargo version.
+
+To update, run these commands from the checkout:
+
+```bash
+git pull --ff-only
+cargo install --path . --locked
+```
+
+The same install command also rebuilds local edits without changing the version.
+Cargo installs the binary only: install the native package manager, optional
+Flatpak, and other runtime requirements separately. Pack creates its user
+configuration on first launch; Cargo does not install a desktop launcher.
+RPM and Arch packages below provide desktop integration and package-manager
+tracking instead. See the [Cargo installation reference](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
+for installation-root overrides.
+
 ### Arch package
 
 From the repository root, build and install the local package with:
@@ -144,7 +190,7 @@ If the same package version is already installed, use
 
 Distribution recipes live in `packaging/arch/` and `packaging/fedora/`.
 
-### From source
+### Manual binary installation
 
 ```bash
 cargo build --release --locked
@@ -175,6 +221,14 @@ theme = "mytheme"
 The theme's `[colors]` section has `selected`, `text`, `muted`, `separator`, and `search` keys. Colors accept names such as `cyan`, palette indexes such as `212`, and hex values such as `"#ff88cc"`. Restart Pack to load changes.
 
 ## Uninstallation
+
+If installed with Cargo:
+
+```bash
+cargo uninstall pack
+```
+
+This removes the Cargo-managed binary and keeps your configuration and cache.
 
 If installed with makepkg:
 
